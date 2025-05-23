@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+/// This script is used to download the markets from the Polymarket API and write them to a file.
+use std::{collections::HashMap, fs::File, io::Write};
 
 use anyhow::Result;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct ApiResponse {
@@ -12,7 +13,7 @@ pub struct ApiResponse {
     pub count: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Market {
     // unclear what the differences between these fields are
     pub closed: bool,
@@ -33,11 +34,10 @@ pub struct Market {
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = Client::new();
-    let mut cursor = None;
+    let mut cursor: Option<String> = None;
+    let mut data = Vec::new();
 
-    let mut page = 0;
     loop {
-        page += 1;
         let mut url = "https://clob.polymarket.com/markets".to_string();
         if let Some(c) = &cursor {
             url.push_str(&format!("?next_cursor={}", c));
@@ -61,19 +61,53 @@ async fn main() -> Result<()> {
         };
 
         println!("limit={} count={} next_cursor={:?}", result.limit, result.count, result.next_cursor);
-        for market in &result.data {
-            // println!(
-            //     "Page: {} Market: {} id={}",
-            //     page, market.question, market.question_id
-            // );
-        }
+        data.extend(result.data);
 
-        if let Some(next) = result.next_cursor {
-            cursor = Some(next);
-        } else {
-            break;
+        match result.next_cursor {
+            Some(next) if result.count == result.limit => cursor = Some(next),
+            // if no next cursor or count is less than limit, we've reached the end
+            _ => break,
         }
     }
 
+    println!("found {} markets, writing to markets.ndjson", data.len());
+
+    // write markets to one json file
+    let mut file = File::create("markets.ndjson")?;
+    for market in data {
+        serde_json::to_writer(&mut file, &market)?;
+        file.write_all(b"\n")?;
+    }
+
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader};
+
+    use super::*;
+
+    #[test]
+    fn test_deserialize_market() -> anyhow::Result<()> {
+        // read markets.json
+        let file = File::open("markets.ndjson")?;
+
+        let mut reader = BufReader::new(file);
+        let mut data = Vec::new();
+        let mut line = String::new();
+
+        while reader.read_line(&mut line)? > 0 {
+            let market: Market = serde_json::from_str(&line)?;
+            data.push(market);
+            line.clear();
+        }
+
+        // check that the data is valid
+        assert!(data.len() > 0);
+        assert!(data[0].question.len() > 0);
+
+        Ok(())
+    }
 }
