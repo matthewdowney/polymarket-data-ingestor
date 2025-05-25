@@ -9,7 +9,7 @@ use prediction_data_ingestor::{MARKETS_FILE, PolymarketMarket};
 use std::{
     collections::HashMap,
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, BufWriter, Write},
     sync::Arc,
     time::Duration,
 };
@@ -108,25 +108,38 @@ impl Connection {
 
         tokio::spawn(async move {
             let mut ws = ws_stream;
-            while let Some(msg) = ws.next().await {
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        if let Err(e) = event_tx
-                            .send(ConnectionEvent::FeedMessage(id.clone(), text.to_string()))
-                        {
-                            tracing::error!("{:?}: failed to send message: {}", id, e);
+            let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+            ping_interval.tick().await;
+            
+            loop {
+                tokio::select! {
+                    Some(msg) = ws.next() => {
+                        match msg {
+                            Ok(Message::Text(text)) => {
+                                if let Err(e) = event_tx
+                                    .send(ConnectionEvent::FeedMessage(id.clone(), text.to_string()))
+                                {
+                                    tracing::error!("{:?}: failed to send message: {}", id, e);
+                                    break;
+                                }
+                            }
+                            Ok(Message::Close(_)) => {
+                                tracing::info!("{:?}: connection closed by server", id);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!("{:?}: WebSocket error: {}", id, e);
+                                break;
+                            }
+                            _ => {} // Ignore other message types
+                        }
+                    }
+                    _ = ping_interval.tick() => {
+                        if let Err(e) = ws.send(Message::Text(r#"{"type":"ping"}"#.into())).await {
+                            tracing::error!("{:?}: failed to send ping: {}", id, e);
                             break;
                         }
                     }
-                    Ok(Message::Close(_)) => {
-                        tracing::info!("{:?}: connection closed by server", id);
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("{:?}: WebSocket error: {}", id, e);
-                        break;
-                    }
-                    _ => {} // Ignore other message types
                 }
             }
             // Notify that the connection is closed
@@ -178,7 +191,7 @@ impl Reconnecter {
     }
 
     pub async fn run(&mut self) {
-        const MAX_PARALLELISM: usize = 10;
+        const MAX_PARALLELISM: usize = 50;
         let mut parallelism = MAX_PARALLELISM;
         let mut error_count: u64 = 0;
 
@@ -362,12 +375,18 @@ async fn main() -> Result<()> {
     let markets: Vec<PolymarketMarket> = load_active_markets()?;
     println!("found {} active markets, connecting...", markets.len());
 
+    // append to a logfile called feed.log, clearing it if it exists
+    let file = File::options().write(true).create(true).truncate(true).open("feed.log")?;
+    let mut writer = BufWriter::new(file);
+
     let mut msg_count = 0;
     let mut bytes_count = 0;
     let mut last_sample_time = Instant::now();
     connect(markets, 12, |msg| {
         msg_count += 1;
         bytes_count += msg.len();
+        writer.write_all(msg.as_bytes())?;
+
         if last_sample_time.elapsed() > Duration::from_secs(15) {
             tracing::info!(
                 "{} messages/sec, {} bytes/sec",
@@ -377,6 +396,7 @@ async fn main() -> Result<()> {
             msg_count = 0;
             bytes_count = 0;
             last_sample_time = Instant::now();
+            writer.flush()?;
         }
         Ok(())
     })
@@ -384,6 +404,5 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// TODO: Add ping/pong to keep the connection alive
 // TODO: Add graceful shutdown
 // TODO: Add running count of # of open and closed connections
