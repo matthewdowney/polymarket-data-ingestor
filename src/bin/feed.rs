@@ -12,8 +12,8 @@ use std::{
     io::{BufRead, BufReader},
     time::Duration,
 };
-use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tokio::{sync::mpsc, time::Instant};
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
@@ -39,18 +39,23 @@ fn load_active_markets() -> Result<Vec<PolymarketMarket>> {
 struct Connection {
     id: ConnectionId,
     markets: Vec<PolymarketMarket>,
-    retry_count: u32,
-    open: bool,
 }
 
 impl Connection {
     async fn try_open(&mut self, event_tx: mpsc::UnboundedSender<ConnectionEvent>) -> Result<()> {
         let url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+
+        let assets_ids = self
+            .markets
+            .iter()
+            .flat_map(|m| m.tokens.iter())
+            .map(|t| t.get("token_id").unwrap().as_str().unwrap())
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>();
         let sub_msg = serde_json::json!({
             "type": "MARKET",
-            "assets_ids": self.markets.iter().flat_map(|m| m.tokens.iter()).map(|t| t.get("token_id").unwrap().as_str().unwrap()).collect::<Vec<_>>(),
+            "assets_ids": assets_ids,
         });
-        tracing::info!("sub_msg: {}", sub_msg.to_string());
 
         // Configure TLS
         let tls = TlsConnector::builder()
@@ -111,22 +116,16 @@ impl Connection {
                         if let Err(e) = event_tx
                             .send(ConnectionEvent::FeedMessage(id.clone(), text.to_string()))
                         {
-                            tracing::error!("failed to send message: {}", e);
+                            tracing::error!("{:?}: failed to send message: {}", id, e);
                             break;
                         }
                     }
                     Ok(Message::Close(_)) => {
-                        tracing::info!("connection closed by server");
-                        event_tx
-                            .send(ConnectionEvent::ConnectionClosed(id.clone()))
-                            .unwrap();
+                        tracing::info!("{:?}: connection closed by server", id);
                         break;
                     }
                     Err(e) => {
-                        tracing::error!("WebSocket error: {}", e);
-                        event_tx
-                            .send(ConnectionEvent::ConnectionClosed(id.clone()))
-                            .unwrap();
+                        tracing::error!("{:?}: WebSocket error: {}", id, e);
                         break;
                     }
                     _ => {} // Ignore other message types
@@ -166,11 +165,6 @@ impl Reconnecter {
         loop {
             if let Some(id) = self.rx.recv().await {
                 if let Some(connection) = self.connections.get_mut(&id) {
-                    if connection.open {
-                        tracing::info!("connection {:?} already open", id);
-                        continue;
-                    }
-
                     if error_count > 0 {
                         tokio::time::sleep(Duration::from_secs(error_count as u64)).await;
                     }
@@ -184,7 +178,6 @@ impl Reconnecter {
                             .unwrap();
                     } else {
                         error_count = 0;
-                        connection.open = true;
                     }
                 } else {
                     tracing::error!("connection {:?} not found", id);
@@ -222,8 +215,6 @@ pub async fn connect(
         let connection = Connection {
             id: ConnectionId(id),
             markets: chunk,
-            retry_count: 0,
-            open: false,
         };
         connections.insert(ConnectionId(id), connection);
         id += 1;
@@ -265,11 +256,24 @@ async fn main() -> Result<()> {
     let markets: Vec<PolymarketMarket> = load_active_markets()?;
     println!("found {} active markets, connecting...", markets.len());
 
-    connect(markets, 12, |msg| {
-        tracing::info!("{}", &msg[..120]);
+    let mut msg_count = 0;
+    let mut bytes_count = 0;
+    let mut last_sample_time = Instant::now();
+    connect(markets, 12, |_msg| {
+        msg_count += 1;
+        if last_sample_time.elapsed() > Duration::from_secs(15) {
+            tracing::info!("{} messages/sec, {} bytes/sec", msg_count / 15, bytes_count / 15);
+            msg_count = 0;
+            bytes_count = 0;
+            last_sample_time = Instant::now();
+        }
         Ok(())
     })
     .await?;
-
     Ok(())
 }
+
+// TODO: Add ping/pong to keep the connection alive
+// TODO: Add graceful shutdown 
+// TODO: Add running count of # of open and closed connections
+// TODO: Maybe a threadpool for connect attempts (or only pipeline if they fail?)
