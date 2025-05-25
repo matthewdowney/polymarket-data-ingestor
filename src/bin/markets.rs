@@ -1,34 +1,17 @@
-/// This script is used to download the markets from the Polymarket API and write them to a file.
-use std::{collections::HashMap, fs::File, io::Write};
+//! This script is used to download the markets from the Polymarket API and write them to a file.
+use std::{fs::File, io::Write, path::Path};
+use prediction_data_ingestor::{MARKETS_FILE, PolymarketMarket};
 
 use anyhow::Result;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct ApiResponse {
-    pub data: Vec<Market>,
+    pub data: Vec<PolymarketMarket>,
     pub next_cursor: Option<String>,
     pub limit: u32,
     pub count: u32,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Market {
-    // unclear what the differences between these fields are
-    pub closed: bool,
-    pub accepting_orders: bool,
-    pub active: bool,
-    pub archived: bool,
-
-    pub condition_id: String,
-    pub question_id: String,
-    pub question: String,
-    pub description: String,
-
-    // there are inconsistencies in the other fields, so treat them dynamically
-    #[serde(flatten)]
-    pub other: HashMap<String, serde_json::Value>,
 }
 
 #[tokio::main]
@@ -60,7 +43,10 @@ async fn main() -> Result<()> {
             }
         };
 
-        println!("limit={} count={} next_cursor={:?}", result.limit, result.count, result.next_cursor);
+        println!(
+            "limit={} count={} next_cursor={:?}",
+            result.limit, result.count, result.next_cursor
+        );
         data.extend(result.data);
 
         match result.next_cursor {
@@ -73,7 +59,14 @@ async fn main() -> Result<()> {
     println!("found {} markets, writing to markets.ndjson", data.len());
 
     // write markets to one json file
-    let mut file = File::create("markets.ndjson")?;
+    {
+        let path = Path::new(MARKETS_FILE);
+        if path.exists() {
+            std::fs::rename(path, path.with_extension(".ndjson.bak"))?;
+        }
+    }
+
+    let mut file = File::create(MARKETS_FILE)?;
     for market in data {
         serde_json::to_writer(&mut file, &market)?;
         file.write_all(b"\n")?;
@@ -81,7 +74,6 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -99,7 +91,7 @@ mod tests {
         let mut line = String::new();
 
         while reader.read_line(&mut line)? > 0 {
-            let market: Market = serde_json::from_str(&line)?;
+            let market: PolymarketMarket = serde_json::from_str(&line)?;
             data.push(market);
             line.clear();
         }
