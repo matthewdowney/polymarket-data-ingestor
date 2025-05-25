@@ -21,6 +21,8 @@ pub struct PolymarketMarket {
     pub question: String,
     pub description: String,
 
+    pub tokens: Vec<serde_json::Value>,
+
     // there are inconsistencies in the other fields, so treat them dynamically
     #[serde(flatten)]
     pub other: HashMap<String, serde_json::Value>,
