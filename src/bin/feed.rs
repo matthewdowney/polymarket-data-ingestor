@@ -10,6 +10,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
+    sync::Arc,
     time::Duration,
 };
 use tokio::time::timeout;
@@ -36,13 +37,14 @@ fn load_active_markets() -> Result<Vec<PolymarketMarket>> {
         .collect())
 }
 
+#[derive(Debug)]
 struct Connection {
     id: ConnectionId,
     markets: Vec<PolymarketMarket>,
 }
 
 impl Connection {
-    async fn try_open(&mut self, event_tx: mpsc::UnboundedSender<ConnectionEvent>) -> Result<()> {
+    async fn try_open(&self, event_tx: mpsc::UnboundedSender<ConnectionEvent>) -> Result<()> {
         let url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
         let assets_ids = self
@@ -67,14 +69,10 @@ impl Connection {
         let config = WebSocketConfig::default();
 
         // Connect to the WebSocket server with TLS
-        let (mut ws_stream, _) = connect_async_tls_with_config(
-            url,
-            Some(config),
-            false, // disable_nagle
-            Some(connector),
-        )
-        .await
-        .context("failed to connect to WebSocket server")?;
+        let (mut ws_stream, _) =
+            connect_async_tls_with_config(url, Some(config), false, Some(connector))
+                .await
+                .context("failed to connect to WebSocket server")?;
 
         // Send subscription message
         ws_stream
@@ -142,7 +140,7 @@ impl Connection {
 struct Reconnecter {
     tx: mpsc::UnboundedSender<ConnectionId>,
     rx: mpsc::UnboundedReceiver<ConnectionId>,
-    connections: HashMap<ConnectionId, Connection>,
+    connections: HashMap<ConnectionId, Arc<Connection>>,
     event_tx: mpsc::UnboundedSender<ConnectionEvent>,
 }
 
@@ -152,6 +150,10 @@ impl Reconnecter {
         event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<ConnectionId>();
+        let connections = connections
+            .into_iter()
+            .map(|(k, v)| (k, Arc::new(v)))
+            .collect();
         Self {
             tx,
             rx,
@@ -160,27 +162,108 @@ impl Reconnecter {
         }
     }
 
-    pub async fn run(&mut self) {
-        let mut error_count = 0;
-        loop {
-            if let Some(id) = self.rx.recv().await {
-                if let Some(connection) = self.connections.get_mut(&id) {
-                    if error_count > 0 {
-                        tokio::time::sleep(Duration::from_secs(error_count as u64)).await;
-                    }
+    async fn open_connection(
+        connection: &Connection,
+        event_tx: mpsc::UnboundedSender<ConnectionEvent>,
+    ) -> Result<ConnectionId, (ConnectionId, anyhow::Error)> {
+        tracing::info!("opening connection {:?}", connection.id);
+        if let Err(e) = connection.try_open(event_tx.clone()).await {
+            event_tx
+                .send(ConnectionEvent::ConnectionClosed(connection.id.clone()))
+                .unwrap();
+            Err((connection.id.clone(), e))
+        } else {
+            Ok(connection.id.clone())
+        }
+    }
 
-                    tracing::info!("opening connection {:?}", id);
-                    if let Err(e) = connection.try_open(self.event_tx.clone()).await {
-                        tracing::error!("error opening connection {:?}: {}", id, e);
-                        error_count += 1;
-                        self.event_tx
-                            .send(ConnectionEvent::ConnectionClosed(id))
-                            .unwrap();
+    pub async fn run(&mut self) {
+        const MAX_PARALLELISM: usize = 10;
+        let mut parallelism = MAX_PARALLELISM;
+        let mut error_count: u64 = 0;
+
+        loop {
+            // Sleep longer if there are errors
+            if error_count > 0 {
+                tracing::debug!(
+                    "backing off for {} seconds before next connection attempt",
+                    error_count
+                );
+                tokio::time::sleep(Duration::from_secs(error_count)).await;
+            } else {
+                // Sleep a bit to avoid hammering the server
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            // Take N connection ids at once to open, but switch to one at a time if there's an error
+            let ids = recv_n(&mut self.rx, parallelism).await;
+            if let Some(ids) = ids {
+                // Fire off all the connection attempts in parallel
+                let mut handles = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(conn) = self.connections.get(&id) {
+                        let conn = Arc::clone(conn);
+                        let event_tx = self.event_tx.clone();
+                        handles.push(tokio::spawn(async move {
+                            Self::open_connection(&conn, event_tx).await
+                        }));
                     } else {
-                        error_count = 0;
+                        tracing::error!("connection {:?} not found", id);
                     }
+                }
+
+                // Check for errors
+                let mut n_errors = 0;
+                let n = handles.len();
+                for handle in handles {
+                    match handle.await {
+                        Ok(Ok(_id)) => {
+                            // Yay
+                        }
+                        Ok(Err((id, e))) => {
+                            tracing::error!(
+                                "error opening connection {:?}: errors={}, error={}",
+                                id,
+                                error_count,
+                                e
+                            );
+                            n_errors += 1;
+                        }
+                        Err(join_error) => {
+                            tracing::error!("join error opening connection: {}", join_error);
+                            n_errors += 1;
+                        }
+                    }
+                }
+
+                // Modify the backoff and parallelism based on success rate.
+                if n_errors > 0 {
+                    // As long as there are errors, reduce the parallelism and increase the error count
+                    parallelism = std::cmp::max(1, parallelism.saturating_sub(1));
+                    error_count += 1;
+                    tracing::debug!(
+                        "{}/{} failed; adjusting parallelism={}, error_count={}",
+                        n_errors,
+                        n,
+                        parallelism,
+                        error_count
+                    );
                 } else {
-                    tracing::error!("connection {:?} not found", id);
+                    // As long as there are successes, increase the parallelism
+                    let nxt_parallelism = std::cmp::min(MAX_PARALLELISM, parallelism + 1);
+                    // Cut the error count in half every time all the connections succeed, cap at MAX_PARALLELISM
+                    let nxt_error_count = std::cmp::min(MAX_PARALLELISM as u64, error_count / 2);
+                    if nxt_parallelism > parallelism || nxt_error_count < error_count {
+                        tracing::debug!(
+                            "{}/{} succeeded; adjusting parallelism={}, error_count={}",
+                            n,
+                            n,
+                            nxt_parallelism,
+                            nxt_error_count
+                        );
+                    }
+                    parallelism = nxt_parallelism;
+                    error_count = nxt_error_count;
                 }
             } else {
                 break;
@@ -189,6 +272,27 @@ impl Reconnecter {
 
         tracing::info!("reconnecter shut down");
     }
+}
+
+async fn recv_n<T>(rx: &mut mpsc::UnboundedReceiver<T>, n: usize) -> Option<Vec<T>> {
+    let mut results = Vec::with_capacity(n);
+
+    let fst = rx.recv().await;
+    if let Some(fst) = fst {
+        results.push(fst);
+    } else {
+        return None;
+    }
+
+    for _ in 0..(n - 1) {
+        if let Ok(nxt) = rx.try_recv() {
+            results.push(nxt);
+        } else {
+            break;
+        }
+    }
+
+    Some(results)
 }
 
 #[derive(Debug)]
@@ -250,8 +354,10 @@ pub async fn connect(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Setup logging
-    tracing_subscriber::fmt::init();
+    // Set up logging
+    tracing_subscriber::fmt()
+        .with_env_filter("feed=debug")
+        .init();
 
     let markets: Vec<PolymarketMarket> = load_active_markets()?;
     println!("found {} active markets, connecting...", markets.len());
@@ -259,10 +365,15 @@ async fn main() -> Result<()> {
     let mut msg_count = 0;
     let mut bytes_count = 0;
     let mut last_sample_time = Instant::now();
-    connect(markets, 12, |_msg| {
+    connect(markets, 12, |msg| {
         msg_count += 1;
+        bytes_count += msg.len();
         if last_sample_time.elapsed() > Duration::from_secs(15) {
-            tracing::info!("{} messages/sec, {} bytes/sec", msg_count / 15, bytes_count / 15);
+            tracing::info!(
+                "{} messages/sec, {} bytes/sec",
+                msg_count / 15,
+                bytes_count / 15
+            );
             msg_count = 0;
             bytes_count = 0;
             last_sample_time = Instant::now();
@@ -274,6 +385,5 @@ async fn main() -> Result<()> {
 }
 
 // TODO: Add ping/pong to keep the connection alive
-// TODO: Add graceful shutdown 
+// TODO: Add graceful shutdown
 // TODO: Add running count of # of open and closed connections
-// TODO: Maybe a threadpool for connect attempts (or only pipeline if they fail?)
