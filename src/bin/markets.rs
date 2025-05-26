@@ -1,18 +1,9 @@
 //! This script is used to download the markets from the Polymarket API and write them to a file.
 use std::{fs::File, io::Write, path::Path};
-use prediction_data_ingestor::{MARKETS_FILE, PolymarketMarket};
+use prediction_data_ingestor::{MARKETS_FILE, ApiResponse};
 
 use anyhow::Result;
 use reqwest::Client;
-use serde::Deserialize;
-
-#[derive(Debug, Deserialize)]
-pub struct ApiResponse {
-    pub data: Vec<PolymarketMarket>,
-    pub next_cursor: Option<String>,
-    pub limit: u32,
-    pub count: u32,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -78,6 +69,8 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader};
+
+    use prediction_data_ingestor::PolymarketMarket;
 
     use super::*;
 

@@ -27,3 +27,11 @@ pub struct PolymarketMarket {
     #[serde(flatten)]
     pub other: HashMap<String, serde_json::Value>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ApiResponse {
+    pub data: Vec<PolymarketMarket>,
+    pub next_cursor: Option<String>,
+    pub limit: u32,
+    pub count: u32,
+}
