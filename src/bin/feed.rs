@@ -7,46 +7,95 @@ use futures_util::{SinkExt, StreamExt};
 use native_tls::TlsConnector;
 use prediction_data_ingestor::{MARKETS_FILE, PolymarketMarket};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::File,
     io::{BufRead, BufReader, BufWriter, Write},
     sync::Arc,
     time::Duration,
 };
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio::{sync::mpsc, time::Instant};
-use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
 
-/// Read the markets from disk and filter out inactive markets.
-fn load_active_markets() -> Result<Vec<PolymarketMarket>> {
-    let file = File::open(MARKETS_FILE).context("failed to open market data file")?;
-    let reader = BufReader::new(file);
+// TODO: Add graceful shutdown
+// TODO: Add running count of # of open and closed connections
+// TODO: Should expose a queue instead of taking a callback
+// TODO: Wrap together with parallel markets fetching beind a PolymarketFeed struct
 
-    let mut markets = Vec::new();
-    for line in reader.lines() {
-        let market: PolymarketMarket =
-            serde_json::from_str(&line?).context("failed to parse market data")?;
-        markets.push(market);
-    }
+/// Each Polymarket WebSocket allows subscribing to this many order books.
+pub const MAX_ASSETS_PER_CONNECTION: usize = 25;
 
-    Ok(markets
-        .into_iter()
-        .filter(|m| m.enable_order_book && m.accepting_orders && !m.archived && !m.closed)
-        .collect())
-}
+/// URL for book data WebSocket feed.
+pub const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
+/// How long to wait for the first socket message before considering the feed dead.
+pub const INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often to send application-level pings to the server.
+pub const PING_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Maximum number of connections to open at once.
+pub const MAX_PARALLELISM: usize = 25;
+
+/// Represents a single WebSocket shard covering a subset of all markets.
 #[derive(Debug)]
 struct Connection {
+    /// Used to identify the connection for restarts etc.
     id: ConnectionId,
+    /// Markets covered by this connection.
     markets: Vec<PolymarketMarket>,
+    /// Used to send events to the main thread.
+    tx: mpsc::UnboundedSender<ConnectionEvent>,
 }
 
-impl Connection {
-    async fn try_open(&self, event_tx: mpsc::UnboundedSender<ConnectionEvent>) -> Result<()> {
-        let url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+/// Underlying WebSocket stream.
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+impl Connection {
+    /// Attempt to open or re-open the WebSocket. Returns an error if the
+    /// connection is not fully open within [`INITIAL_READ_TIMEOUT`] and does
+    /// **not** send a connection closed event.
+    ///
+    /// Otherwise returns Ok(()), and later broadcasts a connection closed event
+    /// when the connection is closed.
+    pub async fn connect(&self) -> Result<()> {
+        // Open the ws and subscribe to books
+        let mut ws = self.open_socket().await?;
+        self.subscribe(&mut ws).await?;
+
+        // Only consider the connection fully open once we see a message,
+        // then spawn a task to handle the rest of the messages
+        self.await_first_msg(&mut ws).await?;
+        self.spawn_msg_handler(ws).await;
+        Ok(())
+    }
+
+    /// Attempt to open a WebSocket connection, and return it immediately when
+    /// the handshake completes.
+    async fn open_socket(&self) -> Result<Socket> {
+        // Configure TLS
+        let tls = TlsConnector::builder()
+            .danger_accept_invalid_certs(false)
+            .build()
+            .context("failed to build TLS connector")?;
+
+        let connector = Connector::NativeTls(tls);
+        let config = WebSocketConfig::default();
+
+        // Connect to the WebSocket server with TLS
+        let (ws_stream, _) =
+            connect_async_tls_with_config(WS_URL, Some(config), false, Some(connector))
+                .await
+                .context("failed to connect to WebSocket server")?;
+
+        Ok(ws_stream)
+    }
+
+    /// Subscribe to the book for each individual token in the set of markets
+    async fn subscribe(&self, ws: &mut Socket) -> Result<()> {
         let assets_ids = self
             .markets
             .iter()
@@ -59,76 +108,64 @@ impl Connection {
             "assets_ids": assets_ids,
         });
 
-        // Configure TLS
-        let tls = TlsConnector::builder()
-            .danger_accept_invalid_certs(false)
-            .build()
-            .context("failed to build TLS connector")?;
-
-        let connector = Connector::NativeTls(tls);
-        let config = WebSocketConfig::default();
-
-        // Connect to the WebSocket server with TLS
-        let (mut ws_stream, _) =
-            connect_async_tls_with_config(url, Some(config), false, Some(connector))
-                .await
-                .context("failed to connect to WebSocket server")?;
-
-        // Send subscription message
-        ws_stream
-            .send(Message::Text(sub_msg.to_string().into()))
+        ws.send(Message::text(sub_msg.to_string()))
             .await
-            .context("failed to send subscription message")?;
+            .context("sending sub msg")?;
+        Ok(())
+    }
 
-        // Await the first response message or timeout
-        const READ_TIMEOUT: Duration = Duration::from_secs(10);
-        let msg = timeout(READ_TIMEOUT, ws_stream.next()).await?;
+    /// Await the first message from the WebSocket, or timeout and close the connection.
+    async fn await_first_msg(&self, ws: &mut Socket) -> Result<()> {
+        let msg = timeout(INITIAL_READ_TIMEOUT, ws.next()).await?;
         if let Some(Ok(Message::Text(text))) = msg {
-            event_tx
+            self.tx
                 .send(ConnectionEvent::FeedMessage(
                     self.id.clone(),
                     text.to_string(),
                 ))
-                .unwrap();
+                .context("sending first feed message")?;
+            Ok(())
         } else {
-            tracing::error!(
-                "no message received within {} seconds",
-                READ_TIMEOUT.as_secs()
-            );
-            event_tx
+            let _ = ws.close(None).await;
+            self.tx
                 .send(ConnectionEvent::ConnectionClosed(self.id.clone()))
-                .unwrap();
-            ws_stream.close(None).await?;
-            return Err(anyhow::anyhow!("no message received"));
+                .context("sending connection closed event")?;
+            Err(anyhow::anyhow!(
+                "no message received within {} seconds",
+                INITIAL_READ_TIMEOUT.as_secs()
+            ))
         }
+    }
 
-        // Spawn a task to handle incoming messages
+    /// Take ownership of the WebSocket and handle incoming messages until the connection closes.
+    async fn spawn_msg_handler(&self, mut ws: Socket) {
         let id = self.id.clone();
-        let event_tx = event_tx.clone();
+        let tx = self.tx.clone();
 
-        tokio::spawn(async move {
-            let mut ws = ws_stream;
-            let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+        let _ = tokio::spawn(async move {
+            let mut ping_interval = tokio::time::interval(PING_INTERVAL);
             ping_interval.tick().await;
-            
+
             loop {
                 tokio::select! {
                     Some(msg) = ws.next() => {
                         match msg {
                             Ok(Message::Text(text)) => {
-                                if let Err(e) = event_tx
-                                    .send(ConnectionEvent::FeedMessage(id.clone(), text.to_string()))
-                                {
-                                    tracing::error!("{:?}: failed to send message: {}", id, e);
+                                if let Err(e) = tx.send(ConnectionEvent::FeedMessage(id.clone(), text.to_string())) {
+                                    tracing::error!("{:?}: failed to send message: {}", id.clone(), e);
                                     break;
                                 }
                             }
                             Ok(Message::Close(_)) => {
-                                tracing::info!("{:?}: connection closed by server", id);
+                                tracing::info!("{:?}: connection closed by server", id.clone());
                                 break;
                             }
                             Err(e) => {
-                                tracing::error!("{:?}: WebSocket error: {}", id, e);
+                                tracing::error!(
+                                    "{:?}: WebSocket error: {}",
+                                    id.clone(),
+                                    e
+                                );
                                 break;
                             }
                             _ => {} // Ignore other message types
@@ -136,28 +173,33 @@ impl Connection {
                     }
                     _ = ping_interval.tick() => {
                         if let Err(e) = ws.send(Message::Text(r#"{"type":"ping"}"#.into())).await {
-                            tracing::error!("{:?}: failed to send ping: {}", id, e);
+                            tracing::error!("{:?}: failed to send ping: {}", id.clone(), e);
                             break;
                         }
                     }
                 }
             }
-            // Notify that the connection is closed
-            let _ = event_tx.send(ConnectionEvent::ConnectionClosed(id));
-        });
 
-        Ok(())
+            // Notify that the connection is closed
+            let _ = tx.send(ConnectionEvent::ConnectionClosed(id.clone()));
+        });
     }
 }
 
+/// Accepts (re)connection requests at any pace and executes them in parallel
+/// with error handling, retries, and backoff. Aggregates all events from open
+/// connections into a single channel.
 struct Reconnecter {
     tx: mpsc::UnboundedSender<ConnectionId>,
     rx: mpsc::UnboundedReceiver<ConnectionId>,
     connections: HashMap<ConnectionId, Arc<Connection>>,
+    /// Aggregate events from all connections into a single channel.
     event_tx: mpsc::UnboundedSender<ConnectionEvent>,
 }
 
 impl Reconnecter {
+    /// Create a new reconnecter which controls the given connections and
+    /// forwards their messages to `event_tx`.
     pub fn new(
         connections: HashMap<ConnectionId, Connection>,
         event_tx: mpsc::UnboundedSender<ConnectionEvent>,
@@ -175,137 +217,108 @@ impl Reconnecter {
         }
     }
 
-    async fn open_connection(
+    /// Monitor connection requests, opening connections in batches and forwarding
+    /// messages to [`Self::event_tx`]. Spawn this in a new task before calling
+    /// [`Self::request_connection`].
+    pub async fn run(&mut self) {
+        let mut error_count: u64 = 0;
+        loop {
+            self.backoff(error_count).await;
+            // Take N connection ids at once to open
+            if let Some(ids) = self.recv_n(MAX_PARALLELISM).await {
+                let n = ids.len();
+                let n_errors = self.open_all(ids).await;
+                error_count = if n_errors > 0 { error_count + 1 } else { 0 };
+                tracing::debug!("{}/{} failed; error_count={}", n_errors, n, error_count);
+            } else {
+                break; // tx is closed
+            }
+        }
+
+        tracing::info!("reconnecter shut down");
+    }
+
+    /// Open a [`Connection`] and send a connection closed event if it fails.
+    async fn connect(
         connection: &Connection,
         event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     ) -> Result<ConnectionId, (ConnectionId, anyhow::Error)> {
         tracing::info!("opening connection {:?}", connection.id);
-        if let Err(e) = connection.try_open(event_tx.clone()).await {
+        if let Err(e) = connection.connect().await {
             event_tx
                 .send(ConnectionEvent::ConnectionClosed(connection.id.clone()))
-                .unwrap();
+                .map_err(|e| (connection.id.clone(), anyhow::anyhow!("failed to send connection closed event: {}", e)))?;
             Err((connection.id.clone(), e))
         } else {
             Ok(connection.id.clone())
         }
     }
 
-    pub async fn run(&mut self) {
-        const MAX_PARALLELISM: usize = 50;
-        let mut parallelism = MAX_PARALLELISM;
-        let mut error_count: u64 = 0;
+    /// Await the next available connection id, and then try to read up
+    /// to `n-1` more without blocking.
+    async fn recv_n(&mut self, n: usize) -> Option<Vec<ConnectionId>> {
+        let Some(fst) = self.rx.recv().await else {
+            return None;
+        };
 
-        loop {
-            // Sleep longer if there are errors
-            if error_count > 0 {
-                tracing::debug!(
-                    "backing off for {} seconds before next connection attempt",
-                    error_count
-                );
-                tokio::time::sleep(Duration::from_secs(error_count)).await;
-            } else {
-                // Sleep a bit to avoid hammering the server
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-
-            // Take N connection ids at once to open, but switch to one at a time if there's an error
-            let ids = recv_n(&mut self.rx, parallelism).await;
-            if let Some(ids) = ids {
-                // Fire off all the connection attempts in parallel
-                let mut handles = Vec::with_capacity(ids.len());
-                for id in ids {
-                    if let Some(conn) = self.connections.get(&id) {
-                        let conn = Arc::clone(conn);
-                        let event_tx = self.event_tx.clone();
-                        handles.push(tokio::spawn(async move {
-                            Self::open_connection(&conn, event_tx).await
-                        }));
-                    } else {
-                        tracing::error!("connection {:?} not found", id);
-                    }
-                }
-
-                // Check for errors
-                let mut n_errors = 0;
-                let n = handles.len();
-                for handle in handles {
-                    match handle.await {
-                        Ok(Ok(_id)) => {
-                            // Yay
-                        }
-                        Ok(Err((id, e))) => {
-                            tracing::error!(
-                                "error opening connection {:?}: errors={}, error={}",
-                                id,
-                                error_count,
-                                e
-                            );
-                            n_errors += 1;
-                        }
-                        Err(join_error) => {
-                            tracing::error!("join error opening connection: {}", join_error);
-                            n_errors += 1;
-                        }
-                    }
-                }
-
-                // Modify the backoff and parallelism based on success rate.
-                if n_errors > 0 {
-                    // As long as there are errors, reduce the parallelism and increase the error count
-                    parallelism = std::cmp::max(1, parallelism.saturating_sub(1));
-                    error_count += 1;
-                    tracing::debug!(
-                        "{}/{} failed; adjusting parallelism={}, error_count={}",
-                        n_errors,
-                        n,
-                        parallelism,
-                        error_count
-                    );
-                } else {
-                    // As long as there are successes, increase the parallelism
-                    let nxt_parallelism = std::cmp::min(MAX_PARALLELISM, parallelism + 1);
-                    // Cut the error count in half every time all the connections succeed, cap at MAX_PARALLELISM
-                    let nxt_error_count = std::cmp::min(MAX_PARALLELISM as u64, error_count / 2);
-                    if nxt_parallelism > parallelism || nxt_error_count < error_count {
-                        tracing::debug!(
-                            "{}/{} succeeded; adjusting parallelism={}, error_count={}",
-                            n,
-                            n,
-                            nxt_parallelism,
-                            nxt_error_count
-                        );
-                    }
-                    parallelism = nxt_parallelism;
-                    error_count = nxt_error_count;
-                }
-            } else {
-                break;
-            }
-        }
-
-        tracing::info!("reconnecter shut down");
-    }
-}
-
-async fn recv_n<T>(rx: &mut mpsc::UnboundedReceiver<T>, n: usize) -> Option<Vec<T>> {
-    let mut results = Vec::with_capacity(n);
-
-    let fst = rx.recv().await;
-    if let Some(fst) = fst {
-        results.push(fst);
-    } else {
-        return None;
-    }
-
-    for _ in 0..(n - 1) {
-        if let Ok(nxt) = rx.try_recv() {
+        let mut results = vec![fst];
+        for _ in 0..(n - 1) {
+            let Ok(nxt) = self.rx.try_recv() else {
+                return Some(results);
+            };
             results.push(nxt);
+        }
+
+        Some(results)
+    }
+
+    async fn backoff(&self, error_count: u64) {
+        if error_count > 0 {
+            let backoff = error_count.max(3);
+            tracing::debug!(
+                "backing off for {} seconds before next connection attempt",
+                backoff
+            );
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
         } else {
-            break;
+            tokio::time::sleep(Duration::from_millis(500)).await; // avoid hammering the server
         }
     }
 
-    Some(results)
+    /// Open all the connections in parallel and count the number of errors.
+    async fn open_all(&mut self, ids: Vec<ConnectionId>) -> usize {
+        // Fire off all the connection attempts in parallel
+        let mut handles = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(conn) = self.connections.get(&id) {
+                let conn = Arc::clone(conn);
+                let event_tx = self.event_tx.clone();
+                handles.push(tokio::spawn(
+                    async move { Self::connect(&conn, event_tx).await },
+                ));
+            } else {
+                tracing::error!("connection {:?} not found", id);
+            }
+        }
+
+        // Count the number of errors
+        let mut n_errors = 0;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(_id)) => {}
+                Ok(Err((id, e))) => {
+                    tracing::error!("error opening connection {:?}: error={}", id, e);
+                    n_errors += 1;
+                }
+                Err(join_error) => {
+                    tracing::error!("join error opening connection: {}", join_error);
+                    n_errors += 1;
+                }
+            }
+        }
+
+        n_errors
+    }
 }
 
 #[derive(Debug)]
@@ -317,30 +330,52 @@ enum ConnectionEvent {
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 struct ConnectionId(u64);
 
+/// Take a chunk of markets from the front of the queue such that
+/// the total number of assets is <= [`MAX_ASSETS_PER_CONNECTION`] 
+/// OR the chunk contains just one market.
+pub fn take_chunk(markets: &mut VecDeque<PolymarketMarket>) -> Vec<PolymarketMarket> {
+    let mut chunk = Vec::new();
+    let mut n_assets = 0;
+    while n_assets < MAX_ASSETS_PER_CONNECTION {
+        if let Some(market) = markets.pop_front() {
+            n_assets += market.tokens.len();
+            // If we've exceeded the limit, push the market back and return the chunk
+            // (unless one market has > MAX_ASSETS_PER_CONNECTION assets)
+            if n_assets > MAX_ASSETS_PER_CONNECTION && !chunk.is_empty() {
+                markets.push_front(market);
+                return chunk;
+            }
+            chunk.push(market);
+        } else {
+            break;
+        }
+    }
+    chunk
+}
+
 pub async fn connect(
-    mut markets: Vec<PolymarketMarket>,
-    chunk_size: usize,
+    mut markets: VecDeque<PolymarketMarket>,
     mut msg_handler: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    // Chunk the markets into groups of `chunk_size` and create a connection for each group
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ConnectionEvent>();
+
+    // Chunk the markets into groups and create a connection for each group
     let mut connections = HashMap::new();
     let mut id = 0;
     while !markets.is_empty() {
-        let chunk = markets
-            .drain(..std::cmp::min(chunk_size, markets.len()))
-            .collect();
+        let chunk = take_chunk(&mut markets);
         let connection = Connection {
             id: ConnectionId(id),
             markets: chunk,
+            tx: event_tx.clone(),
         };
         connections.insert(ConnectionId(id), connection);
         id += 1;
     }
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ConnectionEvent>();
+    // Spawn the reconnecter thread and request all the connections
     let mut reconnecter = Reconnecter::new(connections, event_tx.clone());
     let reconnecter_tx = reconnecter.tx.clone();
-
     tokio::spawn(async move { reconnecter.run().await });
     for id in 0..id {
         reconnecter_tx.send(ConnectionId(id)).unwrap();
@@ -361,8 +396,24 @@ pub async fn connect(
             }
         }
     }
+}
 
-    Ok(())
+/// Read the markets from disk and filter out inactive markets.
+fn load_active_markets() -> Result<Vec<PolymarketMarket>> {
+    let file = File::open(MARKETS_FILE).context("failed to open market data file")?;
+    let reader = BufReader::new(file);
+
+    let mut markets = Vec::new();
+    for line in reader.lines() {
+        let market: PolymarketMarket =
+            serde_json::from_str(&line?).context("failed to parse market data")?;
+        markets.push(market);
+    }
+
+    Ok(markets
+        .into_iter()
+        .filter(|m| m.enable_order_book && m.accepting_orders && !m.archived && !m.closed)
+        .collect())
 }
 
 #[tokio::main]
@@ -376,13 +427,17 @@ async fn main() -> Result<()> {
     println!("found {} active markets, connecting...", markets.len());
 
     // append to a logfile called feed.log, clearing it if it exists
-    let file = File::options().write(true).create(true).truncate(true).open("feed.log")?;
+    let file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open("feed.log")?;
     let mut writer = BufWriter::new(file);
 
     let mut msg_count = 0;
     let mut bytes_count = 0;
     let mut last_sample_time = Instant::now();
-    connect(markets, 12, |msg| {
+    connect(VecDeque::from(markets), |msg| {
         msg_count += 1;
         bytes_count += msg.len();
         writer.write_all(msg.as_bytes())?;
@@ -403,6 +458,3 @@ async fn main() -> Result<()> {
     .await?;
     Ok(())
 }
-
-// TODO: Add graceful shutdown
-// TODO: Add running count of # of open and closed connections
