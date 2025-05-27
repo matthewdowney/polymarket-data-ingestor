@@ -86,10 +86,11 @@ impl Connection {
 
     /// Close the connection if open and wait for the message handler to finish.
     pub async fn close(&mut self) -> Result<()> {
-        self.shutdown_tx
-            .send(true)
-            .context("sending shutdown signal")?;
         if let Some(handle) = self.handle.take() {
+            self.shutdown_tx
+                .send(true)
+                .context("sending shutdown signal")?;
+
             handle
                 .await
                 .context("waiting for message handler to finish")?;

@@ -6,8 +6,8 @@ use std::{
     time::Duration,
 };
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-// TODO: Add graceful shutdown
 // TODO: Add running count of # of open and closed connections
 // TODO: Should expose a queue instead of taking a callback
 // TODO: Wrap together with parallel markets fetching beind a PolymarketFeed struct
@@ -18,7 +18,7 @@ use tokio::time::Instant;
 async fn main() -> Result<()> {
     // Set up logging
     tracing_subscriber::fmt()
-        .with_env_filter("polymarket_data_ingestor=debug")
+        .with_env_filter("polymarket_data_ingestor=debug,feed=debug")
         .init();
 
     let markets: Vec<PolymarketMarket> = load_active_markets()?;
@@ -35,26 +35,38 @@ async fn main() -> Result<()> {
     let mut msg_count = 0;
     let mut bytes_count = 0;
     let mut last_sample_time = Instant::now();
-    let mut client = client::Client::new(Box::new(move |msg| {
-        msg_count += 1;
-        bytes_count += msg.len();
-        writer.write_all(msg.as_bytes())?;
+    let cancel = CancellationToken::new();
+    let mut client = client::Client::new(
+        Box::new(move |msg| {
+            msg_count += 1;
+            bytes_count += msg.len();
+            writer.write_all(msg.as_bytes())?;
 
-        if last_sample_time.elapsed() > Duration::from_secs(15) {
-            tracing::info!(
-                "{} messages/sec, {} bytes/sec",
-                msg_count / 15,
-                bytes_count / 15
-            );
-            msg_count = 0;
-            bytes_count = 0;
-            last_sample_time = Instant::now();
-            writer.flush()?;
-        }
-        Ok(())
-    }));
+            if last_sample_time.elapsed() > Duration::from_secs(15) {
+                tracing::info!(
+                    "{} messages/sec, {} bytes/sec",
+                    msg_count / 15,
+                    bytes_count / 15
+                );
+                msg_count = 0;
+                bytes_count = 0;
+                last_sample_time = Instant::now();
+                writer.flush()?;
+            }
+            Ok(())
+        }),
+        cancel.clone(),
+    );
 
-    client.run_forever(markets).await;
+    let client_handle = tokio::spawn(async move { client.run(markets).await });
+
+    // Wait for ctrl + c, then shut down the client feed
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("shutting down...");
+    cancel.cancel();
+    let _ = client_handle.await;
+    tracing::info!("client feed shut down successfully");
+
     Ok(())
 }
 

@@ -18,11 +18,11 @@ use crate::PolymarketMarket;
 use anyhow::Result;
 use connection::{Connection, ConnectionEvent, ConnectionId};
 use reconnecter::Reconnecter;
-use tokio_util::sync::CancellationToken;
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-pub type MsgHandler = Box<dyn FnMut(&str) -> Result<()>>;
+pub type MsgHandler = Box<dyn FnMut(&str) -> Result<()> + Send>;
 
 /// A client which manages a set of underlying connections to Polymarket book feeds
 /// and aggregates them into a single channel.
@@ -30,59 +30,75 @@ pub struct Client {
     msg_handler: MsgHandler,
     event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     event_rx: mpsc::UnboundedReceiver<ConnectionEvent>,
+    cancel: CancellationToken,
 }
 
 impl Client {
     /// Create a new client with a message handler.
-    pub fn new(msg_handler: MsgHandler) -> Self {
+    pub fn new(msg_handler: MsgHandler, cancel: CancellationToken) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<ConnectionEvent>();
         Self {
             msg_handler,
             event_tx,
             event_rx,
+            cancel,
         }
     }
 
-    /// Open connections to the given markets and loop forever, handling events with the
-    /// Client's message handler.
-    pub async fn run_forever(&mut self, markets: Vec<PolymarketMarket>) {
+    /// Open connections to the given markets and loop until the cancel token is cancelled,
+    /// handling events with the Client's message handler.
+    pub async fn run(&mut self, markets: Vec<PolymarketMarket>) {
         // Distribute the markets across connections
         let connections = self.build_connections(markets);
         let connection_ids = connections.keys().cloned().collect::<Vec<_>>();
 
-        // Spawn a reconnecter task and send connection requests to it
-        let cancel = CancellationToken::new();
-        let mut reconnecter = Reconnecter::new(connections, self.event_tx.clone(), cancel.clone());
+        // Spawn a reconnecter task
+        let cancel_reconnecter = CancellationToken::new();
+        let mut reconnecter = Reconnecter::new(
+            connections,
+            self.event_tx.clone(),
+            cancel_reconnecter.clone(),
+        );
         let reconnecter_tx = reconnecter.tx.clone();
-        let reconnecter_handle =tokio::spawn(async move { reconnecter.run().await });
+        let reconnecter_handle = tokio::spawn(async move { reconnecter.run().await });
 
+        // Initial connection requests
         tracing::info!("sending {} connection requests", connection_ids.len());
         for id in connection_ids {
             reconnecter_tx.send(id.clone()).unwrap();
         }
 
+        // Wait for self to finish
         self.handle_events(reconnecter_tx).await;
-        cancel.cancel();
+
+        // Wait for the reconnecter to finish
+        cancel_reconnecter.cancel();
         let _ = reconnecter_handle.await;
     }
 
-    /// Loop forever, passing events to the message handler and requesting reconnects
-    /// when a connection closes.
+    /// Loop until the cancel token is cancelled, passing events to the message handler
+    /// and requesting reconnects when a connection closes.
     async fn handle_events(&mut self, rtx: mpsc::UnboundedSender<ConnectionId>) {
         loop {
-            if let Some(event) = self.event_rx.recv().await {
-                match &event {
-                    ConnectionEvent::FeedMessage(id, msg) => {
-                        if let Err(e) = (self.msg_handler)(msg) {
-                            tracing::error!("error handling message={:?}: {}", id, e);
-                        }
-                    }
-                    ConnectionEvent::ConnectionClosed(id) => {
-                        if let Err(e) = rtx.send(id.clone()) {
-                            tracing::error!("error sending reconnection request: {}", e);
-                        }
+            // Get the next event or stop early if the cancel token is cancelled
+            let event = tokio::select! {
+                event = self.event_rx.recv() => event,
+                _ = self.cancel.cancelled() => break,
+            };
+
+            // Handle the event
+            match event.as_ref() {
+                Some(ConnectionEvent::FeedMessage(id, msg)) => {
+                    if let Err(e) = (self.msg_handler)(msg) {
+                        tracing::error!("error handling message={:?}: {}", id, e);
                     }
                 }
+                Some(ConnectionEvent::ConnectionClosed(id)) => {
+                    if let Err(e) = rtx.send(id.clone()) {
+                        tracing::error!("error sending reconnection request: {}", e);
+                    }
+                }
+                None => break,
             }
         }
     }
