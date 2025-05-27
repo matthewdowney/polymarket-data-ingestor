@@ -17,3 +17,4 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 futures-util = "0.3"
 native-tls = "0.2"
 base64 = "0.22.1"
+tokio-util = "0.7.15"

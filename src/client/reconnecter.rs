@@ -1,8 +1,11 @@
 use crate::client::MAX_PARALLELISM;
 use crate::client::connection::{Connection, ConnectionEvent, ConnectionId};
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 
 /// Accepts (re)connection requests at any pace and executes them in parallel
 /// with error handling, retries, and backoff. Aggregates all events from open
@@ -32,6 +35,8 @@ pub struct Reconnecter {
     connections: HashMap<ConnectionId, Arc<Mutex<Connection>>>,
     /// Aggregate events from all connections into a single channel.
     event_tx: mpsc::UnboundedSender<ConnectionEvent>,
+    /// Signal that the reconnecter has been stopped.
+    cancel: CancellationToken,
 }
 
 impl Reconnecter {
@@ -40,6 +45,7 @@ impl Reconnecter {
     pub fn new(
         connections: HashMap<ConnectionId, Connection>,
         event_tx: mpsc::UnboundedSender<ConnectionEvent>,
+        cancel: CancellationToken,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<ConnectionId>();
         let connections = connections
@@ -51,15 +57,21 @@ impl Reconnecter {
             rx,
             connections,
             event_tx,
+            cancel,
         }
     }
 
     /// Monitor connection requests, opening connections in batches and forwarding
-    /// messages to [`Self::event_tx`]
+    /// messages to [`Self::event_tx`]. Runs until the cancel token is cancelled.
     pub async fn run(&mut self) {
         let mut error_count: u64 = 0;
         loop {
-            self.backoff(error_count).await;
+            // Either await backoff or cancellation
+            tokio::select! {
+                _ = self.backoff(error_count) => {}
+                _ = self.cancel.cancelled() => break,
+            }
+
             // Take N connection ids at once to open
             if let Some(ids) = self.recv_n(MAX_PARALLELISM).await {
                 let n = ids.len();
@@ -75,7 +87,29 @@ impl Reconnecter {
             }
         }
 
+        self.stop().await;
         tracing::info!("reconnecter shut down");
+    }
+
+    /// Close the reconnecter and wait for all connections to close.
+    async fn stop(&mut self) {
+        // Call close on all connections in parallel
+        let mut tasks = FuturesUnordered::new();
+        for conn in self.connections.values() {
+            let conn = Arc::clone(conn);
+            tasks.push(async move {
+                let mut conn = conn.lock().await;
+                let id = conn.id.clone();
+                conn.close().await.map_err(|e| (id, e))
+            });
+        }
+
+        // Wait for all connections to close
+        while let Some(result) = tasks.next().await {
+            if let Err((id, e)) = result {
+                tracing::error!("error closing connection {:?}: {}", id, e);
+            }
+        }
     }
 
     /// Open a [`Connection`] and send a connection closed event if it fails.

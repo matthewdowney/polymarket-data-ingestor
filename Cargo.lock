@@ -796,6 +796,7 @@ dependencies = [
  "serde_path_to_error",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",

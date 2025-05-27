@@ -61,8 +61,8 @@ impl Connection {
     /// connection is not fully open within [`INITIAL_READ_TIMEOUT`] and does
     /// **not** send a connection closed event.
     ///
-    /// Otherwise returns Ok(()), and later broadcasts a connection closed event
-    /// when the connection is closed.
+    /// Otherwise spawns a message handler, returns Ok(()), and later broadcasts
+    /// a connection closed event when the connection is closed.
     pub async fn connect(&mut self) -> Result<()> {
         // If a connection is already open, close it and reset the shutdown signal
         if self.handle.is_some() {

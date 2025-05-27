@@ -18,6 +18,7 @@ use crate::PolymarketMarket;
 use anyhow::Result;
 use connection::{Connection, ConnectionEvent, ConnectionId};
 use reconnecter::Reconnecter;
+use tokio_util::sync::CancellationToken;
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
@@ -50,9 +51,10 @@ impl Client {
         let connection_ids = connections.keys().cloned().collect::<Vec<_>>();
 
         // Spawn a reconnecter task and send connection requests to it
-        let mut reconnecter = Reconnecter::new(connections, self.event_tx.clone());
+        let cancel = CancellationToken::new();
+        let mut reconnecter = Reconnecter::new(connections, self.event_tx.clone(), cancel.clone());
         let reconnecter_tx = reconnecter.tx.clone();
-        tokio::spawn(async move { reconnecter.run().await });
+        let reconnecter_handle =tokio::spawn(async move { reconnecter.run().await });
 
         tracing::info!("sending {} connection requests", connection_ids.len());
         for id in connection_ids {
@@ -60,6 +62,8 @@ impl Client {
         }
 
         self.handle_events(reconnecter_tx).await;
+        cancel.cancel();
+        let _ = reconnecter_handle.await;
     }
 
     /// Loop forever, passing events to the message handler and requesting reconnects
