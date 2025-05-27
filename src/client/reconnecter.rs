@@ -2,7 +2,7 @@ use crate::client::MAX_PARALLELISM;
 use crate::client::connection::{Connection, ConnectionEvent, ConnectionId};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 /// Accepts (re)connection requests at any pace and executes them in parallel
 /// with error handling, retries, and backoff. Aggregates all events from open
@@ -29,7 +29,7 @@ pub struct Reconnecter {
     /// Channel to send connection requests to.
     pub tx: mpsc::UnboundedSender<ConnectionId>,
     rx: mpsc::UnboundedReceiver<ConnectionId>,
-    connections: HashMap<ConnectionId, Arc<Connection>>,
+    connections: HashMap<ConnectionId, Arc<Mutex<Connection>>>,
     /// Aggregate events from all connections into a single channel.
     event_tx: mpsc::UnboundedSender<ConnectionEvent>,
 }
@@ -44,7 +44,7 @@ impl Reconnecter {
         let (tx, rx) = mpsc::unbounded_channel::<ConnectionId>();
         let connections = connections
             .into_iter()
-            .map(|(k, v)| (k, Arc::new(v)))
+            .map(|(k, v)| (k, Arc::new(Mutex::new(v))))
             .collect();
         Self {
             tx,
@@ -80,7 +80,7 @@ impl Reconnecter {
 
     /// Open a [`Connection`] and send a connection closed event if it fails.
     async fn connect(
-        connection: &Connection,
+        connection: &mut Connection,
         event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     ) -> Result<ConnectionId, (ConnectionId, anyhow::Error)> {
         tracing::info!("opening connection {:?}", connection.id);
@@ -136,9 +136,10 @@ impl Reconnecter {
             if let Some(conn) = self.connections.get(&id) {
                 let conn = Arc::clone(conn);
                 let event_tx = self.event_tx.clone();
-                handles.push(tokio::spawn(
-                    async move { Self::connect(&conn, event_tx).await },
-                ));
+                handles.push(tokio::spawn(async move {
+                    let mut conn = conn.lock().await;
+                    Self::connect(&mut conn, event_tx).await
+                }));
             } else {
                 tracing::error!("connection {:?} not found", id);
             }

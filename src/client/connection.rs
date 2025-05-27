@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use native_tls::TlsConnector;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
@@ -29,19 +30,48 @@ pub struct Connection {
     pub markets: Vec<PolymarketMarket>,
     /// Used to send events to the main thread.
     pub tx: mpsc::UnboundedSender<ConnectionEvent>,
+
+    /// Signals an existing connection to close.
+    shutdown_tx: watch::Sender<bool>,
+
+    /// Handle for the message handler task.
+    handle: Option<JoinHandle<()>>,
 }
 
 /// Underlying WebSocket stream.
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 impl Connection {
+    /// Create a new connection.
+    pub fn new(
+        id: ConnectionId,
+        markets: Vec<PolymarketMarket>,
+        tx: mpsc::UnboundedSender<ConnectionEvent>,
+    ) -> Self {
+        Self {
+            id,
+            markets,
+            tx,
+            shutdown_tx: watch::channel(false).0,
+            handle: None,
+        }
+    }
+
     /// Attempt to open or re-open the WebSocket. Returns an error if the
     /// connection is not fully open within [`INITIAL_READ_TIMEOUT`] and does
     /// **not** send a connection closed event.
     ///
     /// Otherwise returns Ok(()), and later broadcasts a connection closed event
     /// when the connection is closed.
-    pub async fn connect(&self) -> Result<()> {
+    pub async fn connect(&mut self) -> Result<()> {
+        // If a connection is already open, close it and reset the shutdown signal
+        if self.handle.is_some() {
+            self.close().await?;
+            self.shutdown_tx
+                .send(false)
+                .context("resetting shutdown signal")?;
+        }
+
         // Open the ws and subscribe to books
         let mut ws = self.open_socket().await?;
         self.subscribe(&mut ws).await?;
@@ -49,7 +79,21 @@ impl Connection {
         // Only consider the connection fully open once we see a message,
         // then spawn a task to handle the rest of the messages
         self.await_first_msg(&mut ws).await?;
-        self.spawn_msg_handler(ws).await;
+        let handle = self.spawn_msg_handler(ws).await;
+        self.handle = Some(handle);
+        Ok(())
+    }
+
+    /// Close the connection if open and wait for the message handler to finish.
+    pub async fn close(&mut self) -> Result<()> {
+        self.shutdown_tx
+            .send(true)
+            .context("sending shutdown signal")?;
+        if let Some(handle) = self.handle.take() {
+            handle
+                .await
+                .context("waiting for message handler to finish")?;
+        }
         Ok(())
     }
 
@@ -118,11 +162,12 @@ impl Connection {
     }
 
     /// Take ownership of the WebSocket and handle incoming messages until the connection closes.
-    async fn spawn_msg_handler(&self, mut ws: Socket) {
+    async fn spawn_msg_handler(&self, mut ws: Socket) -> JoinHandle<()> {
         let id = self.id.clone();
         let tx = self.tx.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        let _handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut ping_interval = tokio::time::interval(PING_INTERVAL);
             ping_interval.tick().await;
 
@@ -157,11 +202,29 @@ impl Connection {
                             break;
                         }
                     }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() { // if shutdown has been set to true
+                            tracing::info!("{:?}: connection closed by client", id.clone());
+                            break;
+                        }
+                    }
                 }
             }
 
+            // Close the WebSocket
+            let _ = ws.close(None).await;
+
             // Notify that the connection is closed
             let _ = tx.send(ConnectionEvent::ConnectionClosed(id.clone()));
-        });
+        })
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            let _ = self.shutdown_tx.send(true);
+            tracing::info!("{:?}: connection dropped without being closed", self.id);
+        }
     }
 }

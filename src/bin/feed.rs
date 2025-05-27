@@ -13,6 +13,7 @@ use tokio::time::Instant;
 // TODO: Wrap together with parallel markets fetching beind a PolymarketFeed struct
 // TODO: Get rid of unbounded channels
 // TODO: Only show connection status messages once all connections have opened once, show progress reports until then
+// TODO: Enum instead of string for message type
 #[tokio::main]
 async fn main() -> Result<()> {
     // Set up logging

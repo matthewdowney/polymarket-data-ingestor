@@ -90,11 +90,7 @@ impl Client {
         let mut markets = VecDeque::from(m);
         while !markets.is_empty() {
             let chunk = take_chunk(&mut markets);
-            let connection = Connection {
-                id: ConnectionId(id),
-                markets: chunk,
-                tx: self.event_tx.clone(),
-            };
+            let connection = Connection::new(ConnectionId(id), chunk, self.event_tx.clone());
             connections.insert(ConnectionId(id), connection);
             id += 1;
         }
