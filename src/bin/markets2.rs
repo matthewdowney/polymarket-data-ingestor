@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose};
 use futures_util::{TryFutureExt, future::join_all};
-use prediction_data_ingestor::*;
+use polymarket_data_ingestor::*;
 use reqwest::Client;
 use tokio::time::sleep;
 
@@ -26,7 +26,7 @@ async fn fetch_markets() -> Result<Vec<PolymarketMarket>> {
     let mut data = Vec::new();
 
     while !ids.is_empty() {
-        const MAX_CONCURRENCY: usize = 100;
+        const MAX_CONCURRENCY: usize = 60;
         let handles = ids
             .drain(0..MAX_CONCURRENCY.min(ids.len()))
             .map(|id| {
@@ -49,11 +49,11 @@ async fn fetch_markets() -> Result<Vec<PolymarketMarket>> {
                 Ok((page, result)) => {
                     println!("{}: len={:?}", page, result.data.len());
                     if page == n_pages - 1 {
-                        if result.data.len() == 0 {
+                        if result.data.is_empty() {
                             println!("{} was empty; no more pages", page);
                         } else {
                             println!("adding {} more pages to query", MAX_CONCURRENCY);
-                            ids.extend(n_pages..(n_pages+MAX_CONCURRENCY as u64));
+                            ids.extend(n_pages..(n_pages + MAX_CONCURRENCY as u64));
                             n_pages += MAX_CONCURRENCY as u64;
                         }
                     }

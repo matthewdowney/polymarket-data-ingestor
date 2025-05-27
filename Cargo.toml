@@ -1,5 +1,5 @@
 [package]
-name = "prediction-data-ingestor"
+name = "polymarket-data-ingestor"
 version = "0.1.0"
 edition = "2024"
 

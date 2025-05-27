@@ -1,6 +1,6 @@
 //! This script is used to download the markets from the Polymarket API and write them to a file.
+use polymarket_data_ingestor::{ApiResponse, MARKETS_FILE};
 use std::{fs::File, io::Write, path::Path};
-use prediction_data_ingestor::{MARKETS_FILE, ApiResponse};
 
 use anyhow::Result;
 use reqwest::Client;
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
 mod tests {
     use std::io::{BufRead, BufReader};
 
-    use prediction_data_ingestor::PolymarketMarket;
+    use polymarket_data_ingestor::PolymarketMarket;
 
     use super::*;
 
@@ -90,8 +90,8 @@ mod tests {
         }
 
         // check that the data is valid
-        assert!(data.len() > 0);
-        assert!(data[0].question.len() > 0);
+        assert!(!data.is_empty());
+        assert!(!data[0].question.is_empty());
 
         Ok(())
     }
