@@ -8,11 +8,8 @@ use std::{
 use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-// TODO: There's some bug that prevents safe shutdown
-// TODO: Get rid of unbounded channels
-// TODO: Wrap together with parallel markets fetching beind a PolymarketFeed struct
 // TODO: Add running count of # of open and closed connections
-// TODO: Enum instead of string for message type
+// TODO: Wrap together with parallel markets fetching beind a PolymarketFeed struct
 #[tokio::main]
 async fn main() -> Result<()> {
     // Set up logging
@@ -32,7 +29,7 @@ async fn main() -> Result<()> {
     let mut writer = BufWriter::new(file);
 
     // all feed events go to this channel
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<client::ConnectionEvent>();
+    let (event_tx, mut event_rx) = mpsc::channel::<client::ConnectionEvent>(1000);
 
     // spawn a task to handle the events
     let event_handle: JoinHandle<Result<()>> = tokio::spawn(async move {

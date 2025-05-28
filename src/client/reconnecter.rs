@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 /// ```rust,no_run
 ///
 /// // Channel to aggregate events from all connections
-/// let (event_tx, _event_rx) = mpsc::unbounded_channel::<ConnectionEvent>();
+/// let (event_tx, _event_rx) = mpsc::channel::<ConnectionEvent>(1000);
 /// let connections = HashMap::new();
 /// let reconnecter = Reconnecter::new(connections, event_tx);
 ///
@@ -31,11 +31,11 @@ use tokio_util::sync::CancellationToken;
 /// ```
 pub struct Reconnecter {
     /// Channel to send connection requests to.
-    pub tx: mpsc::UnboundedSender<ConnectionId>,
-    rx: mpsc::UnboundedReceiver<ConnectionId>,
+    pub tx: mpsc::Sender<ConnectionId>,
+    rx: mpsc::Receiver<ConnectionId>,
     connections: HashMap<ConnectionId, Arc<Mutex<Connection>>>,
     /// Aggregate events from all connections into a single channel.
-    event_tx: mpsc::UnboundedSender<ConnectionEvent>,
+    event_tx: mpsc::Sender<ConnectionEvent>,
     /// Signal that the reconnecter has been stopped.
     cancel: CancellationToken,
     /// Counter of connections that have *ever* been opened successfully.
@@ -47,10 +47,10 @@ impl Reconnecter {
     /// forwards their messages to `event_tx`.
     pub fn new(
         connections: HashMap<ConnectionId, Connection>,
-        event_tx: mpsc::UnboundedSender<ConnectionEvent>,
+        event_tx: mpsc::Sender<ConnectionEvent>,
         cancel: CancellationToken,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel::<ConnectionId>();
+        let (tx, rx) = mpsc::channel::<ConnectionId>(1000);
         let connections = connections
             .into_iter()
             .map(|(k, v)| (k, Arc::new(Mutex::new(v))))
@@ -81,7 +81,7 @@ impl Reconnecter {
                 _ = self.cancel.cancelled() => break,
             }
 
-            // Take N connection ids at once to open
+            // Take N connection ids at once to open (returns None if the cancel token is cancelled)
             if let Some(ids) = self.recv_n(MAX_PARALLELISM).await {
                 let n = ids.len();
                 let n_errors = self.open_all(ids).await;
@@ -105,6 +105,7 @@ impl Reconnecter {
             }
         }
 
+        tracing::debug!("main reconnecter loop finished, closing connections");
         self.stop().await;
         tracing::info!("reconnecter shut down");
     }
@@ -136,13 +137,14 @@ impl Reconnecter {
     /// Open a [`Connection`] and send a connection closed event if it fails.
     async fn connect(
         connection: &mut Connection,
-        event_tx: mpsc::UnboundedSender<ConnectionEvent>,
+        event_tx: mpsc::Sender<ConnectionEvent>,
         n_open: &AtomicUsize,
     ) -> Result<ConnectionId, (ConnectionId, anyhow::Error)> {
         let is_reconnect = connection.has_ever_opened;
         if let Err(e) = connection.connect().await {
             event_tx
                 .send(ConnectionEvent::ConnectionClosed(connection.id.clone()))
+                .await
                 .map_err(|e| {
                     (
                         connection.id.clone(),
@@ -162,7 +164,10 @@ impl Reconnecter {
     /// Await the next available connection id, and then try to read up
     /// to `n-1` more without blocking.
     async fn recv_n(&mut self, n: usize) -> Option<Vec<ConnectionId>> {
-        let fst = self.rx.recv().await?;
+        let fst = tokio::select! {
+            id = self.rx.recv() => id?,
+            _ = self.cancel.cancelled() => return None,
+        };
 
         let mut results = vec![fst];
         for _ in 0..(n - 1) {

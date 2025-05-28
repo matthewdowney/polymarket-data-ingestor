@@ -29,7 +29,7 @@ pub struct Connection {
     /// Markets covered by this connection.
     pub markets: Vec<PolymarketMarket>,
     /// Used to send events to the main thread.
-    pub tx: mpsc::UnboundedSender<ConnectionEvent>,
+    pub tx: mpsc::Sender<ConnectionEvent>,
     /// False before first successful connection.
     pub has_ever_opened: bool,
 
@@ -49,7 +49,7 @@ impl Connection {
     pub fn new(
         id: ConnectionId,
         markets: Vec<PolymarketMarket>,
-        tx: mpsc::UnboundedSender<ConnectionEvent>,
+        tx: mpsc::Sender<ConnectionEvent>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
@@ -155,12 +155,14 @@ impl Connection {
                     self.id.clone(),
                     text.to_string(),
                 ))
+                .await
                 .context("sending first feed message")?;
             Ok(())
         } else {
             let _ = ws.close(None).await;
             self.tx
                 .send(ConnectionEvent::ConnectionClosed(self.id.clone()))
+                .await
                 .context("sending connection closed event")?;
             Err(anyhow::anyhow!(
                 "no message received within {} seconds",
@@ -184,7 +186,7 @@ impl Connection {
                     Some(msg) = ws.next() => {
                         match msg {
                             Ok(Message::Text(text)) => {
-                                if let Err(e) = tx.send(ConnectionEvent::FeedMessage(id.clone(), text.to_string())) {
+                                if let Err(e) = tx.send(ConnectionEvent::FeedMessage(id.clone(), text.to_string())).await {
                                     tracing::error!("{:?}: failed to send message: {}", id.clone(), e);
                                     break;
                                 }
@@ -210,8 +212,6 @@ impl Connection {
                         if *shutdown_rx.borrow() { // if shutdown has been set to true
                             tracing::info!("{:?}: connection closed by client", id.clone());
                             break;
-                        } else {
-                            tracing::debug!("{:?}: connection not closed by client", id.clone());
                         }
                     }
                 }
@@ -221,7 +221,7 @@ impl Connection {
             let _ = ws.close(None).await;
 
             // Notify that the connection is closed
-            let _ = tx.send(ConnectionEvent::ConnectionClosed(id.clone()));
+            let _ = tx.send(ConnectionEvent::ConnectionClosed(id.clone())).await;
         })
     }
 }

@@ -26,15 +26,15 @@ pub use connection::ConnectionEvent;
 /// A client which manages a set of underlying connections to Polymarket book feeds
 /// and aggregates them into a single channel.
 pub struct Client {
-    event_tx: mpsc::UnboundedSender<ConnectionEvent>,
-    event_rx: mpsc::UnboundedReceiver<ConnectionEvent>,
+    event_tx: mpsc::Sender<ConnectionEvent>,
+    event_rx: mpsc::Receiver<ConnectionEvent>,
     cancel: CancellationToken,
 }
 
 impl Client {
     /// Create a new client with a message handler.
     pub fn new(cancel: CancellationToken) -> Self {
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<ConnectionEvent>();
+        let (event_tx, event_rx) = mpsc::channel::<ConnectionEvent>(1000);
         Self {
             event_tx,
             event_rx,
@@ -47,7 +47,7 @@ impl Client {
     pub async fn run(
         &mut self,
         markets: Vec<PolymarketMarket>,
-        tx: mpsc::UnboundedSender<ConnectionEvent>,
+        tx: mpsc::Sender<ConnectionEvent>,
     ) {
         // Distribute the markets across connections
         let connections = self.build_connections(markets);
@@ -66,7 +66,10 @@ impl Client {
         // Initial connection requests
         tracing::info!("requesting {} socket connections", connection_ids.len());
         for id in connection_ids {
-            reconnecter_tx.send(id.clone()).unwrap();
+            if let Err(e) = reconnecter_tx.send(id.clone()).await {
+                tracing::error!("error sending reconnection request: {}", e);
+                break;
+            }
         }
 
         // Wait for self to finish
@@ -81,8 +84,8 @@ impl Client {
     /// and requesting reconnects when a connection closes.
     async fn handle_events(
         &mut self,
-        rtx: mpsc::UnboundedSender<ConnectionId>,
-        client_tx: mpsc::UnboundedSender<ConnectionEvent>,
+        rtx: mpsc::Sender<ConnectionId>,
+        client_tx: mpsc::Sender<ConnectionEvent>,
     ) {
         loop {
             // Get the next event or stop early if the cancel token is cancelled
@@ -95,7 +98,7 @@ impl Client {
                 let should_continue = match &event {
                     ConnectionEvent::FeedMessage(_, _) => true,
                     ConnectionEvent::ConnectionClosed(id) => {
-                        if let Err(e) = rtx.send(id.clone()) {
+                        if let Err(e) = rtx.send(id.clone()).await {
                             tracing::error!("error sending reconnection request: {}", e);
                             false
                         } else {
@@ -105,7 +108,7 @@ impl Client {
                 };
 
                 // Forward to client
-                if client_tx.send(event).is_err() || !should_continue {
+                if client_tx.send(event).await.is_err() || !should_continue {
                     break;
                 }
             } else {
