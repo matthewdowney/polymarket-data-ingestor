@@ -187,15 +187,11 @@ impl Connection {
                                 }
                             }
                             Ok(Message::Close(_)) => {
-                                tracing::info!("{:?}: connection closed by server", id.clone());
+                                tracing::warn!("{:?}: connection closed by server", id.clone());
                                 break;
                             }
                             Err(e) => {
-                                tracing::error!(
-                                    "{:?}: WebSocket error: {}",
-                                    id.clone(),
-                                    e
-                                );
+                                tracing::warn!("{:?}: WebSocket error: {}", id.clone(), e);
                                 break;
                             }
                             _ => {} // Ignore other message types

@@ -15,19 +15,17 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(15);
 pub const MAX_PARALLELISM: usize = 50;
 
 use crate::PolymarketMarket;
-use anyhow::Result;
-use connection::{Connection, ConnectionEvent, ConnectionId};
+use connection::{Connection, ConnectionId};
 use reconnecter::Reconnecter;
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub type MsgHandler = Box<dyn FnMut(&str) -> Result<()> + Send>;
+pub use connection::ConnectionEvent;
 
 /// A client which manages a set of underlying connections to Polymarket book feeds
 /// and aggregates them into a single channel.
 pub struct Client {
-    msg_handler: MsgHandler,
     event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     event_rx: mpsc::UnboundedReceiver<ConnectionEvent>,
     cancel: CancellationToken,
@@ -35,10 +33,9 @@ pub struct Client {
 
 impl Client {
     /// Create a new client with a message handler.
-    pub fn new(msg_handler: MsgHandler, cancel: CancellationToken) -> Self {
+    pub fn new(cancel: CancellationToken) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<ConnectionEvent>();
         Self {
-            msg_handler,
             event_tx,
             event_rx,
             cancel,
@@ -46,8 +43,12 @@ impl Client {
     }
 
     /// Open connections to the given markets and loop until the cancel token is cancelled,
-    /// handling events with the Client's message handler.
-    pub async fn run(&mut self, markets: Vec<PolymarketMarket>) {
+    /// handling events by passing them to the provided channel.
+    pub async fn run(
+        &mut self,
+        markets: Vec<PolymarketMarket>,
+        tx: mpsc::UnboundedSender<ConnectionEvent>,
+    ) {
         // Distribute the markets across connections
         let connections = self.build_connections(markets);
         let connection_ids = connections.keys().cloned().collect::<Vec<_>>();
@@ -69,7 +70,7 @@ impl Client {
         }
 
         // Wait for self to finish
-        self.handle_events(reconnecter_tx).await;
+        self.handle_events(reconnecter_tx, tx).await;
 
         // Wait for the reconnecter to finish
         cancel_reconnecter.cancel();
@@ -78,7 +79,11 @@ impl Client {
 
     /// Loop until the cancel token is cancelled, passing events to the message handler
     /// and requesting reconnects when a connection closes.
-    async fn handle_events(&mut self, rtx: mpsc::UnboundedSender<ConnectionId>) {
+    async fn handle_events(
+        &mut self,
+        rtx: mpsc::UnboundedSender<ConnectionId>,
+        client_tx: mpsc::UnboundedSender<ConnectionEvent>,
+    ) {
         loop {
             // Get the next event or stop early if the cancel token is cancelled
             let event = tokio::select! {
@@ -86,21 +91,29 @@ impl Client {
                 _ = self.cancel.cancelled() => break,
             };
 
-            // Handle the event
-            match event.as_ref() {
-                Some(ConnectionEvent::FeedMessage(id, msg)) => {
-                    if let Err(e) = (self.msg_handler)(msg) {
-                        tracing::error!("error handling message={:?}: {}", id, e);
+            if let Some(event) = event {
+                let should_continue = match &event {
+                    ConnectionEvent::FeedMessage(_, _) => true,
+                    ConnectionEvent::ConnectionClosed(id) => {
+                        if let Err(e) = rtx.send(id.clone()) {
+                            tracing::error!("error sending reconnection request: {}", e);
+                            false
+                        } else {
+                            true
+                        }
                     }
+                };
+
+                // Forward to client
+                if client_tx.send(event).is_err() || !should_continue {
+                    break;
                 }
-                Some(ConnectionEvent::ConnectionClosed(id)) => {
-                    if let Err(e) = rtx.send(id.clone()) {
-                        tracing::error!("error sending reconnection request: {}", e);
-                    }
-                }
-                None => break,
+            } else {
+                break;
             }
         }
+
+        tracing::info!("client event handler shut down");
     }
 
     // Split the markets across different connections

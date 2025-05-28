@@ -5,11 +5,10 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Write},
     time::Duration,
 };
-use tokio::time::Instant;
+use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-// TODO: Only show connection status messages once all connections have opened once, show progress reports until then
-// TODO: Should expose a queue instead of taking a callback
+// TODO: There's some bug that prevents safe shutdown
 // TODO: Get rid of unbounded channels
 // TODO: Wrap together with parallel markets fetching beind a PolymarketFeed struct
 // TODO: Add running count of # of open and closed connections
@@ -32,39 +31,54 @@ async fn main() -> Result<()> {
         .open("feed.log")?;
     let mut writer = BufWriter::new(file);
 
-    let mut msg_count = 0;
-    let mut bytes_count = 0;
-    let mut last_sample_time = Instant::now();
-    let cancel = CancellationToken::new();
-    let mut client = client::Client::new(
-        Box::new(move |msg| {
-            msg_count += 1;
-            bytes_count += msg.len();
-            writer.write_all(msg.as_bytes())?;
+    // all feed events go to this channel
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<client::ConnectionEvent>();
 
-            if last_sample_time.elapsed() > Duration::from_secs(15) {
-                tracing::info!(
-                    "{} messages/sec, {} bytes/sec",
-                    msg_count / 15,
-                    bytes_count / 15
-                );
-                msg_count = 0;
-                bytes_count = 0;
-                last_sample_time = Instant::now();
-                writer.flush()?;
+    // spawn a task to handle the events
+    let event_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
+        let mut msg_count = 0;
+        let mut bytes_count = 0;
+        let mut last_sample_time = Instant::now();
+
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                client::ConnectionEvent::FeedMessage(_id, msg) => {
+                    msg_count += 1;
+                    bytes_count += msg.len();
+                    writer.write_all(msg.as_bytes())?;
+
+                    if last_sample_time.elapsed() > Duration::from_secs(15) {
+                        tracing::info!(
+                            "{} messages/sec, {} bytes/sec",
+                            msg_count / 15,
+                            bytes_count / 15
+                        );
+                        msg_count = 0;
+                        bytes_count = 0;
+                        last_sample_time = Instant::now();
+                        writer.flush()?;
+                    }
+                }
+                client::ConnectionEvent::ConnectionClosed(_id) => (),
             }
-            Ok(())
-        }),
-        cancel.clone(),
-    );
+        }
+        tracing::info!("event handler shut down");
+        Ok(())
+    });
 
-    let client_handle = tokio::spawn(async move { client.run(markets).await });
+    // start the feed
+    let cancel = CancellationToken::new();
+    let mut client = client::Client::new(cancel.clone());
+    let client_handle = tokio::spawn(async move { client.run(markets, event_tx).await });
 
     // Wait for ctrl + c, then shut down the client feed
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutting down...");
+
     cancel.cancel();
     let _ = client_handle.await;
+    let _ = event_handle.await;
+
     tracing::info!("client feed shut down successfully");
 
     Ok(())
