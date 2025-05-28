@@ -91,15 +91,12 @@ impl Reconnecter {
                     _ => error_count + 1,
                 };
 
-                if !self.all_have_opened() {
-                    tracing::debug!(
-                        "{} of {} socket connections opened",
-                        self.n_opened.load(Ordering::Relaxed),
-                        self.connections.len()
-                    );
-                } else {
-                    tracing::debug!("{}/{} reconnects succeeded", n - n_errors, n)
-                }
+                tracing::debug!(
+                    "{}/{} new connections succeeded, backing off {:?}",
+                    n - n_errors,
+                    n,
+                    self.backoff_duration(error_count)
+                );
             } else {
                 break; // tx is closed
             }
@@ -180,11 +177,17 @@ impl Reconnecter {
         Some(results)
     }
 
+    fn backoff_duration(&self, error_count: u64) -> Duration {
+        if error_count > 0 {
+            Duration::from_secs(error_count.max(3))
+        } else {
+            Duration::from_millis(500)
+        }
+    }
+
     async fn backoff(&self, error_count: u64) {
         if error_count > 0 {
-            let backoff = error_count.max(3);
-            tracing::debug!("backing off for {} seconds", backoff);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            tokio::time::sleep(self.backoff_duration(error_count)).await;
         } else {
             tokio::time::sleep(Duration::from_millis(500)).await; // avoid hammering the server
         }

@@ -8,7 +8,6 @@ use std::{
 use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-// TODO: Add running count of # of open and closed connections
 // TODO: Wrap together with parallel markets fetching beind a PolymarketFeed struct
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,26 +28,31 @@ async fn main() -> Result<()> {
     let mut writer = BufWriter::new(file);
 
     // all feed events go to this channel
-    let (event_tx, mut event_rx) = mpsc::channel::<client::ConnectionEvent>(1000);
+    let (event_tx, mut event_rx) = mpsc::channel::<client::FeedEvent>(1000);
 
     // spawn a task to handle the events
     let event_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
         let mut msg_count = 0;
         let mut bytes_count = 0;
         let mut last_sample_time = Instant::now();
+        let mut have_all_connections_opened = false;
+        let mut n_connections_open = 0;
+        let mut n_connections_total = 0;
 
         while let Some(event) = event_rx.recv().await {
             match event {
-                client::ConnectionEvent::FeedMessage(_id, msg) => {
+                client::FeedEvent::FeedMessage(msg) => {
                     msg_count += 1;
                     bytes_count += msg.len();
                     writer.write_all(msg.as_bytes())?;
 
                     if last_sample_time.elapsed() > Duration::from_secs(15) {
                         tracing::info!(
-                            "{} messages/sec, {} bytes/sec",
+                            "{} messages/sec, {} bytes/sec, {}/{} connections open",
                             msg_count / 15,
-                            bytes_count / 15
+                            bytes_count / 15,
+                            n_connections_open,
+                            n_connections_total
                         );
                         msg_count = 0;
                         bytes_count = 0;
@@ -56,7 +60,18 @@ async fn main() -> Result<()> {
                         writer.flush()?;
                     }
                 }
-                client::ConnectionEvent::ConnectionClosed(_id) => (),
+                client::FeedEvent::ConnectionOpened(_id, n_open, n_connections) => {
+                    n_connections_open = n_open;
+                    n_connections_total = n_connections;
+                    if n_open == n_connections && !have_all_connections_opened {
+                        have_all_connections_opened = true;
+                        tracing::info!("all {} connections opened", n_connections);
+                    }
+                }
+                client::FeedEvent::ConnectionClosed(_id, n_open, n_connections) => {
+                    n_connections_open = n_open;
+                    n_connections_total = n_connections;
+                }
             }
         }
         tracing::info!("event handler shut down");

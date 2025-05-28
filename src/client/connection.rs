@@ -14,8 +14,9 @@ use crate::client::{INITIAL_READ_TIMEOUT, PING_INTERVAL, WS_URL};
 
 #[derive(Debug)]
 pub enum ConnectionEvent {
-    FeedMessage(ConnectionId, String),
+    FeedMessage(String),
     ConnectionClosed(ConnectionId),
+    ConnectionOpened(ConnectionId),
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
@@ -151,10 +152,12 @@ impl Connection {
         let msg = timeout(INITIAL_READ_TIMEOUT, ws.next()).await?;
         if let Some(Ok(Message::Text(text))) = msg {
             self.tx
-                .send(ConnectionEvent::FeedMessage(
-                    self.id.clone(),
-                    text.to_string(),
-                ))
+                .send(ConnectionEvent::ConnectionOpened(self.id.clone()))
+                .await
+                .context("sending connection opened event")?;
+
+            self.tx
+                .send(ConnectionEvent::FeedMessage(text.to_string()))
                 .await
                 .context("sending first feed message")?;
             Ok(())
@@ -186,7 +189,7 @@ impl Connection {
                     Some(msg) = ws.next() => {
                         match msg {
                             Ok(Message::Text(text)) => {
-                                if let Err(e) = tx.send(ConnectionEvent::FeedMessage(id.clone(), text.to_string())).await {
+                                if let Err(e) = tx.send(ConnectionEvent::FeedMessage(text.to_string())).await {
                                     tracing::error!("{:?}: failed to send message: {}", id.clone(), e);
                                     break;
                                 }
