@@ -111,6 +111,8 @@ impl Reconnecter {
 
     /// Close the reconnecter and wait for all connections to close.
     async fn stop(&mut self) {
+        tracing::debug!("stopping reconnecter");
+
         // Call close on all connections in parallel
         let mut tasks = FuturesUnordered::new();
         for conn in self.connections.values() {
@@ -123,6 +125,7 @@ impl Reconnecter {
         }
 
         // Wait for all connections to close
+        tracing::debug!("waiting for connections to close");
         while let Some(result) = tasks.next().await {
             if let Err((id, e)) = result {
                 tracing::error!("error closing connection {:?}: {}", id, e);

@@ -35,6 +35,7 @@ pub struct Connection {
 
     /// Signals an existing connection to close.
     shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 
     /// Handle for the message handler task.
     handle: Option<JoinHandle<()>>,
@@ -50,11 +51,13 @@ impl Connection {
         markets: Vec<PolymarketMarket>,
         tx: mpsc::UnboundedSender<ConnectionEvent>,
     ) -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             id,
             markets,
             tx,
-            shutdown_tx: watch::channel(false).0,
+            shutdown_tx,
+            shutdown_rx,
             handle: None,
             has_ever_opened: false,
         }
@@ -170,7 +173,7 @@ impl Connection {
     async fn spawn_msg_handler(&self, mut ws: Socket) -> JoinHandle<()> {
         let id = self.id.clone();
         let tx = self.tx.clone();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let mut shutdown_rx = self.shutdown_rx.clone();
 
         tokio::spawn(async move {
             let mut ping_interval = tokio::time::interval(PING_INTERVAL);
@@ -207,6 +210,8 @@ impl Connection {
                         if *shutdown_rx.borrow() { // if shutdown has been set to true
                             tracing::info!("{:?}: connection closed by client", id.clone());
                             break;
+                        } else {
+                            tracing::debug!("{:?}: connection not closed by client", id.clone());
                         }
                     }
                 }
