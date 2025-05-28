@@ -8,11 +8,11 @@ use std::{
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-// TODO: Add running count of # of open and closed connections
-// TODO: Should expose a queue instead of taking a callback
-// TODO: Wrap together with parallel markets fetching beind a PolymarketFeed struct
-// TODO: Get rid of unbounded channels
 // TODO: Only show connection status messages once all connections have opened once, show progress reports until then
+// TODO: Should expose a queue instead of taking a callback
+// TODO: Get rid of unbounded channels
+// TODO: Wrap together with parallel markets fetching beind a PolymarketFeed struct
+// TODO: Add running count of # of open and closed connections
 // TODO: Enum instead of string for message type
 #[tokio::main]
 async fn main() -> Result<()> {

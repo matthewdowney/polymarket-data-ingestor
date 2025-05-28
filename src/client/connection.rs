@@ -30,6 +30,8 @@ pub struct Connection {
     pub markets: Vec<PolymarketMarket>,
     /// Used to send events to the main thread.
     pub tx: mpsc::UnboundedSender<ConnectionEvent>,
+    /// False before first successful connection.
+    pub has_ever_opened: bool,
 
     /// Signals an existing connection to close.
     shutdown_tx: watch::Sender<bool>,
@@ -54,6 +56,7 @@ impl Connection {
             tx,
             shutdown_tx: watch::channel(false).0,
             handle: None,
+            has_ever_opened: false,
         }
     }
 
@@ -81,6 +84,7 @@ impl Connection {
         self.await_first_msg(&mut ws).await?;
         let handle = self.spawn_msg_handler(ws).await;
         self.handle = Some(handle);
+        self.has_ever_opened = true;
         Ok(())
     }
 

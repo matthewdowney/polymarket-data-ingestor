@@ -63,7 +63,7 @@ impl Client {
         let reconnecter_handle = tokio::spawn(async move { reconnecter.run().await });
 
         // Initial connection requests
-        tracing::info!("sending {} connection requests", connection_ids.len());
+        tracing::info!("requesting {} socket connections", connection_ids.len());
         for id in connection_ids {
             reconnecter_tx.send(id.clone()).unwrap();
         }

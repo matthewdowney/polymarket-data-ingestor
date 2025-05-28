@@ -2,6 +2,7 @@ use crate::client::MAX_PARALLELISM;
 use crate::client::connection::{Connection, ConnectionEvent, ConnectionId};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, mpsc};
@@ -37,6 +38,8 @@ pub struct Reconnecter {
     event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     /// Signal that the reconnecter has been stopped.
     cancel: CancellationToken,
+    /// Counter of connections that have *ever* been opened successfully.
+    n_opened: Arc<AtomicUsize>,
 }
 
 impl Reconnecter {
@@ -58,7 +61,13 @@ impl Reconnecter {
             connections,
             event_tx,
             cancel,
+            n_opened: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Check if all connections have opened at least once.
+    fn all_have_opened(&self) -> bool {
+        self.n_opened.load(Ordering::Relaxed) == self.connections.len()
     }
 
     /// Monitor connection requests, opening connections in batches and forwarding
@@ -81,7 +90,12 @@ impl Reconnecter {
                     _ if n_errors < n / 2 => error_count,
                     _ => error_count + 1,
                 };
-                tracing::debug!("{}/{} failed; error_count={}", n_errors, n, error_count);
+
+                tracing::debug!(
+                    "{} of {} socket connections open",
+                    self.n_opened.load(Ordering::Relaxed),
+                    self.connections.len()
+                );
             } else {
                 break; // tx is closed
             }
@@ -116,8 +130,9 @@ impl Reconnecter {
     async fn connect(
         connection: &mut Connection,
         event_tx: mpsc::UnboundedSender<ConnectionEvent>,
+        n_open: &AtomicUsize,
     ) -> Result<ConnectionId, (ConnectionId, anyhow::Error)> {
-        tracing::info!("opening connection {:?}", connection.id);
+        let is_reconnect = connection.has_ever_opened;
         if let Err(e) = connection.connect().await {
             event_tx
                 .send(ConnectionEvent::ConnectionClosed(connection.id.clone()))
@@ -129,6 +144,10 @@ impl Reconnecter {
                 })?;
             Err((connection.id.clone(), e))
         } else {
+            // Increment the counter on the first connection success
+            if !is_reconnect {
+                n_open.fetch_add(1, Ordering::Relaxed);
+            }
             Ok(connection.id.clone())
         }
     }
@@ -170,9 +189,10 @@ impl Reconnecter {
             if let Some(conn) = self.connections.get(&id) {
                 let conn = Arc::clone(conn);
                 let event_tx = self.event_tx.clone();
+                let n_open = Arc::clone(&self.n_opened);
                 handles.push(tokio::spawn(async move {
                     let mut conn = conn.lock().await;
-                    Self::connect(&mut conn, event_tx).await
+                    Self::connect(&mut conn, event_tx, &n_open).await
                 }));
             } else {
                 tracing::error!("connection {:?} not found", id);
@@ -185,10 +205,14 @@ impl Reconnecter {
             match handle.await {
                 Ok(Ok(_id)) => {}
                 Ok(Err((id, e))) => {
-                    tracing::error!("error opening connection {:?}: error={}", id, e);
+                    // Only log errors after first successful connection
+                    if self.all_have_opened() {
+                        tracing::error!("error reopening connection {:?}: error={}", id, e);
+                    }
                     n_errors += 1;
                 }
                 Err(join_error) => {
+                    // Only log errors after first successful connection
                     tracing::error!("join error opening connection: {}", join_error);
                     n_errors += 1;
                 }
