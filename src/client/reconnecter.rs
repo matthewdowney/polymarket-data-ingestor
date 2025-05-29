@@ -1,34 +1,16 @@
-use crate::client::MAX_PARALLELISM;
 use crate::client::connection::{Connection, ConnectionEvent, ConnectionId};
-use futures_util::StreamExt;
+use crate::client::MAX_PARALLELISM;
 use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// Accepts (re)connection requests at any pace and executes them in parallel
 /// with error handling, retries, and backoff. Aggregates all events from open
 /// connections into a single channel.
-///
-/// # Example
-///
-/// ```rust,no_run
-///
-/// // Channel to aggregate events from all connections
-/// let (event_tx, _event_rx) = mpsc::channel::<ConnectionEvent>(1000);
-/// let connections = HashMap::new();
-/// let reconnecter = Reconnecter::new(connections, event_tx);
-///
-/// // Spawn reconnecter task and send connection requests to tx
-/// let tx = reconnecter.tx.clone();
-/// tokio::spawn(async move { reconnecter.run().await });
-///
-/// for conn in connections.values() {
-///     tx.send(conn.id).await.unwrap();
-/// }
-/// ```
 pub struct Reconnecter {
     /// Channel to send connection requests to.
     pub tx: mpsc::Sender<ConnectionId>,

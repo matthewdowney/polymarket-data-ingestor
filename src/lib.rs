@@ -1,11 +1,50 @@
+//! A library for interacting with Polymarket's book feeds and API.
+//!
+//! Fetch market data and subscribe to real-time order book feeds with automatic
+//! connection management and reconnection.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use polymarket_data_ingestor::client::{PolymarketClient, FeedEvent};
+//! use tokio_util::sync::CancellationToken;
+//! use tokio::sync::mpsc;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let cancel = CancellationToken::new();
+//!     let mut client = PolymarketClient::new(cancel.clone());
+//!     
+//!     // Fetch active markets from API
+//!     let markets = client.fetch_active_markets().await?;
+//!     
+//!     // Set up event handling
+//!     let (tx, mut rx) = mpsc::channel(1000);
+//!     tokio::spawn(async move {
+//!         while let Some(event) = rx.recv().await {
+//!             match event {
+//!                 FeedEvent::FeedMessage(msg) => println!("Data: {}", msg),
+//!                 FeedEvent::ConnectionOpened(_, open, total) => {
+//!                     println!("Connection opened ({}/{})", open, total);
+//!                 }
+//!                 FeedEvent::ConnectionClosed(_, open, total) => {
+//!                     println!("Connection closed ({}/{})", open, total);
+//!                 }
+//!             }
+//!         }
+//!     });
+//!     
+//!     // Start real-time feeds
+//!     client.run(markets, tx).await;
+//!     Ok(())
+//! }
+//! ```
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
 pub mod client;
-
-/// A newline-delimited JSON file of all markets from the Polymarket API.
-pub const MARKETS_FILE: &str = "markets.ndjson";
 
 /// A market from the Polymarket API, which may be active or inactive,
 /// past present or future.
@@ -37,7 +76,7 @@ impl PolymarketMarket {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ApiResponse {
+pub struct MarketsApiResponse {
     pub data: Vec<PolymarketMarket>,
     pub next_cursor: Option<String>,
     pub limit: u32,

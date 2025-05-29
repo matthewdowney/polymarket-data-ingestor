@@ -1,14 +1,13 @@
-use anyhow::{Context, Result};
-use polymarket_data_ingestor::{MARKETS_FILE, PolymarketMarket, client};
+use anyhow::Result;
+use polymarket_data_ingestor::{client, PolymarketMarket};
 use std::{
     fs::File,
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{BufWriter, Write},
     time::Duration,
 };
 use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
-// TODO: Wrap together with parallel markets fetching beind a PolymarketFeed struct
 #[tokio::main]
 async fn main() -> Result<()> {
     // Set up logging
@@ -16,7 +15,11 @@ async fn main() -> Result<()> {
         .with_env_filter("polymarket_data_ingestor=debug,feed=debug")
         .init();
 
-    let markets: Vec<PolymarketMarket> = load_active_markets()?;
+    // Create client to fetch markets from API
+    let cancel = CancellationToken::new();
+    let mut client = client::PolymarketClient::new(cancel.clone());
+
+    let markets: Vec<PolymarketMarket> = client.fetch_active_markets().await?;
     println!("found {} active markets, connecting...", markets.len());
 
     // append to a logfile called feed.log, clearing it if it exists
@@ -44,7 +47,7 @@ async fn main() -> Result<()> {
                 client::FeedEvent::FeedMessage(msg) => {
                     msg_count += 1;
                     bytes_count += msg.len();
-                    
+
                     writer.write_all(msg.as_bytes())?;
                     if !msg.is_empty() && !msg.ends_with('\n') {
                         writer.write_all(b"\n")?;
@@ -82,9 +85,7 @@ async fn main() -> Result<()> {
         Ok(())
     });
 
-    // start the feed
-    let cancel = CancellationToken::new();
-    let mut client = client::Client::new(cancel.clone());
+    // start the feed using the same client instance
     let client_handle = tokio::spawn(async move { client.run(markets, event_tx).await });
 
     // Wait for ctrl + c, then shut down the client feed
@@ -98,20 +99,4 @@ async fn main() -> Result<()> {
     tracing::info!("client feed shut down successfully");
 
     Ok(())
-}
-
-/// Read the markets from disk and filter out inactive markets.
-fn load_active_markets() -> Result<Vec<PolymarketMarket>> {
-    let file = File::open(MARKETS_FILE).context("failed to open market data file")?;
-    let reader = BufReader::new(file);
-
-    let mut markets = Vec::new();
-    for line in reader.lines() {
-        let m: PolymarketMarket = serde_json::from_str(&line?).context("market parse failed")?;
-        if m.is_active() {
-            markets.push(m);
-        }
-    }
-
-    Ok(markets)
 }

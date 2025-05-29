@@ -1,3 +1,5 @@
+//! Client for Polymarket WebSocket connections and API interactions.
+
 mod connection;
 mod reconnecter;
 
@@ -14,44 +16,64 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// Maximum number of connections to open at once.
 pub const MAX_PARALLELISM: usize = 50;
 
-use crate::PolymarketMarket;
+use crate::{MarketsApiResponse, PolymarketMarket};
+use anyhow::Result;
+use base64::{engine::general_purpose, Engine as _};
 use connection::{Connection, ConnectionEvent, ConnectionId};
+use futures_util::{future::join_all, TryFutureExt};
 use reconnecter::Reconnecter;
+use reqwest;
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-/// A client which manages a set of underlying connections to Polymarket book feeds
-/// and aggregates them into a single channel.
-pub struct Client {
+/// Client for Polymarket's trading data feeds and API.
+///
+/// Fetches market data and manages WebSocket connections with automatic reconnection.
+pub struct PolymarketClient {
     event_tx: mpsc::Sender<ConnectionEvent>,
     event_rx: mpsc::Receiver<ConnectionEvent>,
     cancel: CancellationToken,
+    http_client: reqwest::Client,
 }
 
+/// Events emitted by the client during operation.
 #[derive(Debug)]
 pub enum FeedEvent {
+    /// A raw JSON message received from the WebSocket feed.
     FeedMessage(String),
-    /// (id, n_open_connections, n_total_connections)
+    /// A WebSocket connection was successfully opened.
+    ///
+    /// Contains: (connection_id, number_of_open_connections, total_connections)
     ConnectionOpened(ConnectionId, usize, usize),
-    /// (id, n_open_connections, n_total_connections)
-    /// Emitted when an open connection closes or when an initial connection attempt fails.
+    /// A WebSocket connection was closed or failed to connect.
+    ///
+    /// Contains: (connection_id, number_of_open_connections, total_connections)
+    ///
+    /// This event is emitted both when an open connection closes and when
+    /// an initial connection attempt fails.
     ConnectionClosed(ConnectionId, usize, usize),
 }
 
-impl Client {
-    /// Create a new client with a message handler.
+impl PolymarketClient {
+    /// Creates a new client instance.
+    ///
+    /// The cancellation token is used for graceful shutdown.
     pub fn new(cancel: CancellationToken) -> Self {
         let (event_tx, event_rx) = mpsc::channel::<ConnectionEvent>(1000);
         Self {
             event_tx,
             event_rx,
             cancel,
+            http_client: reqwest::Client::new(),
         }
     }
 
-    /// Open connections to the given markets and loop until the cancel token is cancelled,
-    /// handling events by passing them to the provided channel.
+    /// Starts WebSocket connections for real-time data feeds.
+    ///
+    /// Distributes markets across multiple connections and runs until cancelled.
+    /// Sends `FeedEvent`s through the provided channel.
     pub async fn run(&mut self, markets: Vec<PolymarketMarket>, tx: mpsc::Sender<FeedEvent>) {
         // Distribute the markets across connections
         let connections = self.build_connections(markets);
@@ -156,6 +178,97 @@ impl Client {
 
         connections
     }
+
+    /// Fetches all active markets from the Polymarket API.
+    ///
+    /// Returns only markets that are currently accepting orders.
+    pub async fn fetch_active_markets(&self) -> Result<Vec<PolymarketMarket>> {
+        let markets = self.fetch_markets().await?;
+        Ok(markets.into_iter().filter(|m| m.is_active()).collect())
+    }
+
+    /// Fetches all markets from the Polymarket API using concurrent pagination.
+    pub async fn fetch_markets(&self) -> Result<Vec<PolymarketMarket>> {
+        let mut n_pages = 100;
+        let mut ids = (0..n_pages).collect::<Vec<_>>();
+        let mut data = Vec::new();
+        let mut consecutive_errors = 0;
+
+        while !ids.is_empty() {
+            const MAX_CONCURRENCY: usize = 60;
+            let handles = ids
+                .drain(0..MAX_CONCURRENCY.min(ids.len()))
+                .map(|id| {
+                    self.get_page(if id == 0 {
+                        None
+                    } else {
+                        Some(encode_number_to_base64(id * 500))
+                    })
+                    .map_err(move |e| (id, e))
+                    .map_ok(move |result| (id, result))
+                })
+                .collect::<Vec<_>>();
+
+            let mut saw_error = false;
+            let results = join_all(handles).await;
+            for result in results {
+                match result {
+                    Ok((page, result)) => {
+                        if page == n_pages - 1 {
+                            if result.data.is_empty() {
+                                tracing::debug!("{} was empty; no more pages", page);
+                            } else {
+                                tracing::debug!("adding {} more pages to query", MAX_CONCURRENCY);
+                                ids.extend(n_pages..(n_pages + MAX_CONCURRENCY as u64));
+                                n_pages += MAX_CONCURRENCY as u64;
+                            }
+                        }
+
+                        data.extend(result.data);
+                    }
+                    Err((page, e)) => {
+                        ids.push(page);
+                        tracing::warn!("{}: error={:?}", page, e);
+                        saw_error = true;
+                    }
+                }
+            }
+
+            consecutive_errors = if saw_error { consecutive_errors + 1 } else { 0 };
+            if !ids.is_empty() {
+                sleep(Duration::from_secs(consecutive_errors)).await;
+            }
+        }
+
+        Ok(data)
+    }
+
+    /// Fetches a single page of markets from the API.
+    async fn get_page(&self, cursor: Option<String>) -> Result<MarketsApiResponse> {
+        let mut url = "https://clob.polymarket.com/markets".to_string();
+        if let Some(c) = &cursor {
+            url.push_str(&format!("?next_cursor={}", c));
+        }
+
+        let res = self
+            .http_client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+
+        let de = &mut serde_json::Deserializer::from_slice(&res);
+        let result: MarketsApiResponse = serde_path_to_error::deserialize(de)?;
+        Ok(result)
+    }
+}
+
+/// Encodes a number to base64 for use as a pagination cursor.
+fn encode_number_to_base64(n: u64) -> String {
+    let num_str = n.to_string();
+    general_purpose::STANDARD.encode(num_str.as_bytes())
 }
 
 /// Take a chunk of markets from the front of the queue such that the total number of
