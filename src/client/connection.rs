@@ -213,7 +213,7 @@ impl Connection {
                     }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() { // if shutdown has been set to true
-                            tracing::info!("{:?}: connection closed by client", id.clone());
+                            tracing::debug!("{:?}: connection closed by client", id.clone());
                             break;
                         }
                     }

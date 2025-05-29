@@ -44,7 +44,11 @@ async fn main() -> Result<()> {
                 client::FeedEvent::FeedMessage(msg) => {
                     msg_count += 1;
                     bytes_count += msg.len();
+                    
                     writer.write_all(msg.as_bytes())?;
+                    if !msg.is_empty() && !msg.ends_with('\n') {
+                        writer.write_all(b"\n")?;
+                    }
 
                     if last_sample_time.elapsed() > Duration::from_secs(15) {
                         tracing::info!(
