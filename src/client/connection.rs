@@ -2,15 +2,16 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use native_tls::TlsConnector;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
-use crate::PolymarketMarket;
 use crate::client::{INITIAL_READ_TIMEOUT, PING_INTERVAL, WS_URL};
+use crate::PolymarketMarket;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 pub enum ConnectionEvent {
@@ -35,8 +36,7 @@ pub struct Connection {
     pub has_ever_opened: bool,
 
     /// Signals an existing connection to close.
-    shutdown_tx: watch::Sender<bool>,
-    shutdown_rx: watch::Receiver<bool>,
+    shutdown: CancellationToken,
 
     /// Handle for the message handler task.
     handle: Option<JoinHandle<()>>,
@@ -52,13 +52,11 @@ impl Connection {
         markets: Vec<PolymarketMarket>,
         tx: mpsc::Sender<ConnectionEvent>,
     ) -> Self {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             id,
             markets,
             tx,
-            shutdown_tx,
-            shutdown_rx,
+            shutdown: CancellationToken::new(),
             handle: None,
             has_ever_opened: false,
         }
@@ -74,9 +72,7 @@ impl Connection {
         // If a connection is already open, close it and reset the shutdown signal
         if self.handle.is_some() {
             self.close().await?;
-            self.shutdown_tx
-                .send(false)
-                .context("resetting shutdown signal")?;
+            self.shutdown = CancellationToken::new();
         }
 
         // Open the ws and subscribe to books
@@ -95,9 +91,7 @@ impl Connection {
     /// Close the connection if open and wait for the message handler to finish.
     pub async fn close(&mut self) -> Result<()> {
         if let Some(handle) = self.handle.take() {
-            self.shutdown_tx
-                .send(true)
-                .context("sending shutdown signal")?;
+            self.shutdown.cancel();
 
             handle
                 .await
@@ -133,7 +127,7 @@ impl Connection {
             .markets
             .iter()
             .flat_map(|m| m.tokens.iter())
-            .map(|t| t.get("token_id").unwrap().as_str().unwrap())
+            .map(|t| t.token_id.as_str())
             .filter(|id| !id.is_empty())
             .collect::<Vec<_>>();
         let sub_msg = serde_json::json!({
@@ -178,7 +172,7 @@ impl Connection {
     async fn spawn_msg_handler(&self, mut ws: Socket) -> JoinHandle<()> {
         let id = self.id.clone();
         let tx = self.tx.clone();
-        let mut shutdown_rx = self.shutdown_rx.clone();
+        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             let mut ping_interval = tokio::time::interval(PING_INTERVAL);
@@ -190,16 +184,16 @@ impl Connection {
                         match msg {
                             Ok(Message::Text(text)) => {
                                 if let Err(e) = tx.send(ConnectionEvent::FeedMessage(text.to_string())).await {
-                                    tracing::error!("{:?}: failed to send message: {}", id.clone(), e);
+                                    tracing::error!(connection_id = ?id, error = %e, "failed to send message");
                                     break;
                                 }
                             }
                             Ok(Message::Close(_)) => {
-                                tracing::warn!("{:?}: connection closed by server", id.clone());
+                                tracing::warn!(connection_id = ?id, "connection closed by server");
                                 break;
                             }
                             Err(e) => {
-                                tracing::warn!("{:?}: WebSocket error: {}", id.clone(), e);
+                                tracing::warn!(connection_id = ?id, error = %e, "WebSocket error");
                                 break;
                             }
                             _ => {} // Ignore other message types
@@ -207,15 +201,13 @@ impl Connection {
                     }
                     _ = ping_interval.tick() => {
                         if let Err(e) = ws.send(Message::Text(r#"{"type":"ping"}"#.into())).await {
-                            tracing::error!("{:?}: failed to send ping: {}", id.clone(), e);
+                            tracing::error!(connection_id = ?id, error = %e, "failed to send ping");
                             break;
                         }
                     }
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() { // if shutdown has been set to true
-                            tracing::debug!("{:?}: connection closed by client", id.clone());
-                            break;
-                        }
+                    _ = shutdown.cancelled() => {
+                        tracing::debug!(connection_id = ?id, "connection closed by client");
+                        break;
                     }
                 }
             }
@@ -232,8 +224,8 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         if self.handle.is_some() {
-            let _ = self.shutdown_tx.send(true);
-            tracing::info!("{:?}: connection dropped without being closed", self.id);
+            self.shutdown.cancel();
+            tracing::info!(connection_id = ?self.id, "connection dropped without being closed");
         }
     }
 }

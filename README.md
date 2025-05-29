@@ -1,6 +1,8 @@
 # Polymarket Data Ingestor
 
-A Rust library for Polymarket's trading data feeds and API.
+A library for streaming Polymarket's book data.
+
+Discovers all live markets and manages as many WebSocket connections as needed to stream book data for all of them to a single channel. Handles reconnects and backoff.
 
 ## Usage
 
@@ -13,6 +15,13 @@ Run the included examples:
 ```bash
 # Real-time order book feed for every live market
 cargo run --bin feed
+```
+
+## Testing
+
+To run integration tests which will fetch markets and spin up some connections:
+```bash
+cargo test -- --ignored
 ```
 
 ## License

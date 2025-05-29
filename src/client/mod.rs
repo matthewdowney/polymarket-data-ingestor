@@ -20,10 +20,13 @@ use crate::{MarketsApiResponse, PolymarketMarket};
 use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
 use connection::{Connection, ConnectionEvent, ConnectionId};
+use futures::Stream;
 use futures_util::{future::join_all, TryFutureExt};
 use reconnecter::Reconnecter;
 use reqwest;
 use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -54,6 +57,25 @@ pub enum FeedEvent {
     /// This event is emitted both when an open connection closes and when
     /// an initial connection attempt fails.
     ConnectionClosed(ConnectionId, usize, usize),
+}
+
+/// A stream of feed events from the Polymarket client.
+pub struct FeedEventStream {
+    rx: mpsc::Receiver<FeedEvent>,
+}
+
+impl Stream for FeedEventStream {
+    type Item = FeedEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+impl FeedEventStream {
+    fn new(rx: mpsc::Receiver<FeedEvent>) -> Self {
+        Self { rx }
+    }
 }
 
 impl PolymarketClient {
@@ -91,10 +113,13 @@ impl PolymarketClient {
         let reconnecter_handle = tokio::spawn(async move { reconnecter.run().await });
 
         // Initial connection requests
-        tracing::info!("requesting {} socket connections", connection_ids.len());
+        tracing::info!(
+            connection_count = connection_ids.len(),
+            "requesting socket connections"
+        );
         for id in connection_ids {
             if let Err(e) = reconnecter_tx.send(id.clone()).await {
-                tracing::error!("error sending reconnection request: {}", e);
+                tracing::error!(error = %e, "error sending reconnection request");
                 break;
             }
         }
@@ -136,12 +161,11 @@ impl PolymarketClient {
                     ConnectionEvent::ConnectionClosed(id) => {
                         // Only decrement the open count if the connection was actually open,
                         // not if it failed during the initial connection attempt.
-                        if id_is_open.contains_key(&id) {
+                        if id_is_open.remove(&id).is_some() {
                             n_open -= 1;
-                            id_is_open.remove(&id);
                         }
                         if let Err(e) = rtx.send(id.clone()).await {
-                            tracing::error!("error sending reconnection request: {}", e);
+                            tracing::error!(error = %e, "error sending reconnection request");
                             (
                                 false,
                                 FeedEvent::ConnectionClosed(id, n_open, n_connections),
@@ -187,6 +211,26 @@ impl PolymarketClient {
         Ok(markets.into_iter().filter(|m| m.is_active()).collect())
     }
 
+    /// Creates a stream of events for the given markets.
+    ///
+    /// This consumes the client and returns a stream that yields `FeedEvent`s
+    /// and a join handle for the background task.
+    /// The stream will run until the client's cancellation token is cancelled.
+    pub async fn into_stream(
+        mut self,
+        markets: Vec<PolymarketMarket>,
+    ) -> Result<(FeedEventStream, tokio::task::JoinHandle<()>)> {
+        let (tx, rx) = mpsc::channel(1000);
+        let stream = FeedEventStream::new(rx);
+
+        // Start the feed in a background task
+        let handle = tokio::spawn(async move {
+            self.run(markets, tx).await;
+        });
+
+        Ok((stream, handle))
+    }
+
     /// Fetches all markets from the Polymarket API using concurrent pagination.
     pub async fn fetch_markets(&self) -> Result<Vec<PolymarketMarket>> {
         let mut n_pages = 100;
@@ -195,7 +239,7 @@ impl PolymarketClient {
         let mut consecutive_errors = 0;
 
         while !ids.is_empty() {
-            const MAX_CONCURRENCY: usize = 60;
+            const MAX_CONCURRENCY: usize = 30;
             let handles = ids
                 .drain(0..MAX_CONCURRENCY.min(ids.len()))
                 .map(|id| {
@@ -228,7 +272,7 @@ impl PolymarketClient {
                     }
                     Err((page, e)) => {
                         ids.push(page);
-                        tracing::warn!("{}: error={:?}", page, e);
+                        tracing::warn!("page={}: error={}", page, e);
                         saw_error = true;
                     }
                 }
@@ -250,16 +294,17 @@ impl PolymarketClient {
             url.push_str(&format!("?next_cursor={}", c));
         }
 
-        let res = self
-            .http_client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+        let res = self.http_client.get(url).send().await?;
 
-        let de = &mut serde_json::Deserializer::from_slice(&res);
+        // Handle rate limit errors without stack trace
+        if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(anyhow::anyhow!("HTTP 429: rate limit exceeded"));
+        }
+
+        let res = res.error_for_status()?;
+        let bytes = res.bytes().await?;
+
+        let de = &mut serde_json::Deserializer::from_slice(&bytes);
         let result: MarketsApiResponse = serde_path_to_error::deserialize(de)?;
         Ok(result)
     }
@@ -292,4 +337,10 @@ fn take_chunk(markets: &mut VecDeque<PolymarketMarket>) -> Vec<PolymarketMarket>
         }
     }
     chunk
+}
+
+impl Drop for PolymarketClient {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }

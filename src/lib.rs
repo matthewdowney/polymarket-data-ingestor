@@ -8,34 +8,29 @@
 //! ```rust,no_run
 //! use polymarket_data_ingestor::client::{PolymarketClient, FeedEvent};
 //! use tokio_util::sync::CancellationToken;
-//! use tokio::sync::mpsc;
+//! use futures::StreamExt;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let cancel = CancellationToken::new();
-//!     let mut client = PolymarketClient::new(cancel.clone());
+//!     let client = PolymarketClient::new(cancel.clone());
 //!     
-//!     // Fetch active markets from API
-//!     let markets = client.fetch_active_markets().await?;
+//!     // Create a stream of events for all active markets
+//!     let mut stream = client.into_active_markets_stream().await?;
 //!     
-//!     // Set up event handling
-//!     let (tx, mut rx) = mpsc::channel(1000);
-//!     tokio::spawn(async move {
-//!         while let Some(event) = rx.recv().await {
-//!             match event {
-//!                 FeedEvent::FeedMessage(msg) => println!("Data: {}", msg),
-//!                 FeedEvent::ConnectionOpened(_, open, total) => {
-//!                     println!("Connection opened ({}/{})", open, total);
-//!                 }
-//!                 FeedEvent::ConnectionClosed(_, open, total) => {
-//!                     println!("Connection closed ({}/{})", open, total);
-//!                 }
+//!     // Process events from the stream
+//!     while let Some(event) = stream.next().await {
+//!         match event {
+//!             FeedEvent::FeedMessage(msg) => println!("Data: {}", msg),
+//!             FeedEvent::ConnectionOpened(_, open, total) => {
+//!                 println!("Connection opened ({}/{})", open, total);
+//!             }
+//!             FeedEvent::ConnectionClosed(_, open, total) => {
+//!                 println!("Connection closed ({}/{})", open, total);
 //!             }
 //!         }
-//!     });
+//!     }
 //!     
-//!     // Start real-time feeds
-//!     client.run(markets, tx).await;
 //!     Ok(())
 //! }
 //! ```
@@ -45,6 +40,19 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 pub mod client;
+
+/// A token represents one outcome in a prediction market.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MarketToken {
+    pub outcome: String,
+    pub price: f64,
+    pub token_id: String,
+    pub winner: bool,
+
+    // Additional fields that may be present
+    #[serde(flatten)]
+    pub other: HashMap<String, serde_json::Value>,
+}
 
 /// A market from the Polymarket API, which may be active or inactive,
 /// past present or future.
@@ -62,7 +70,7 @@ pub struct PolymarketMarket {
     pub question: String,
     pub description: String,
 
-    pub tokens: Vec<serde_json::Value>,
+    pub tokens: Vec<MarketToken>,
 
     // there are inconsistencies in the other fields, so treat them dynamically
     #[serde(flatten)]
