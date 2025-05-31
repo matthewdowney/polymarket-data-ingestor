@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Set up feed handler with the correct data directory
-    let base_path = PathBuf::from(".");
+    let base_path = PathBuf::from("./data");
     assert!(base_path.exists(), "data directory does not exist");
     let mut handler = FeedHandler::new(base_path)?;
 

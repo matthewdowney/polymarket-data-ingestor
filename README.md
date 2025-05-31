@@ -24,6 +24,22 @@ To run integration tests which will fetch markets and spin up some connections:
 cargo test -- --ignored
 ```
 
+
+# Deploy 
+
+    # 1. Setup (once)
+    gcloud auth login
+    gcloud config set project YOUR_PROJECT_ID
+    cp terraform.tfvars.example terraform.tfvars
+    # Edit terraform.tfvars
+
+    terraform init
+    terraform apply
+
+    # 2. Deploy
+    cargo build --release
+    ./deploy.sh
+
 ## License
 
 MIT

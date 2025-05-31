@@ -2,3 +2,6 @@
 .swp
 *.zst
 .claude
+terraform-deployer-key.json
+.terraform*
+terraform.tfstate*
