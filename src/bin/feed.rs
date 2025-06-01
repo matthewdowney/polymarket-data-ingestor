@@ -16,6 +16,7 @@ use zstd::stream::write::Encoder;
 /// Handles feed events with automatic hourly file rotation
 struct FeedHandler {
     data_dir: PathBuf,
+    current_dir: PathBuf,
     current_writer: Option<Encoder<'static, BufWriter<File>>>,
     current_hour_timestamp: u64,
 
@@ -31,14 +32,12 @@ struct FeedHandler {
 impl FeedHandler {
     fn new<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
+        let current_dir = data_dir.join("current");
         std::fs::create_dir_all(&data_dir)?;
+        std::fs::create_dir_all(&current_dir)?;
 
         let current_hour_timestamp = Self::get_current_hour_timestamp();
-        let filename = format!(
-            "{}.jsonl.zst",
-            Self::get_current_hour_filename(current_hour_timestamp)
-        );
-        let filepath = data_dir.join(&filename);
+        let filepath = current_dir.join("log.jsonl.zst");
 
         let file = OpenOptions::new()
             .create(true)
@@ -48,13 +47,13 @@ impl FeedHandler {
         let encoder = Encoder::new(buf_writer, 3)?;
 
         tracing::info!(
-            filename = filename,
             filepath = %filepath.display(),
-            "initialized log file"
+            "initialized current log file"
         );
 
         Ok(Self {
             data_dir,
+            current_dir,
             current_writer: Some(encoder),
             current_hour_timestamp,
             msg_count: 0,
@@ -85,22 +84,27 @@ impl FeedHandler {
             // Close current writer if exists
             if let Some(writer) = self.current_writer.take() {
                 writer.finish()?;
-                tracing::info!(
-                    previous_hour = Self::get_current_hour_filename(self.current_hour_timestamp),
-                    "rotated to new hourly file"
-                );
+                
+                // Move the current file to timestamped filename
+                let old_filename = Self::get_current_hour_filename(self.current_hour_timestamp);
+                let old_filepath = self.data_dir.join(format!("{}.jsonl.zst", old_filename));
+                let current_filepath = self.current_dir.join("log.jsonl.zst");
+                
+                if current_filepath.exists() {
+                    std::fs::rename(&current_filepath, &old_filepath)?;
+                    tracing::info!(
+                        old_filepath = %old_filepath.display(),
+                        "rotated log file for upload"
+                    );
+                }
             }
 
-            // Create new file
-            let filename = format!(
-                "{}.jsonl.zst",
-                Self::get_current_hour_filename(current_hour)
-            );
-            let filepath = self.data_dir.join(&filename);
-
+            // Create new current file
+            let filepath = self.current_dir.join("log.jsonl.zst");
             let file = OpenOptions::new()
                 .create(true)
-                .append(true)
+                .truncate(true)
+                .write(true)
                 .open(&filepath)?;
             let buf_writer = BufWriter::new(file);
             let encoder = Encoder::new(buf_writer, 3)?;
@@ -109,9 +113,8 @@ impl FeedHandler {
             self.current_hour_timestamp = current_hour;
 
             tracing::info!(
-                filename = filename,
                 filepath = %filepath.display(),
-                "created new hourly file"
+                "created new current log file"
             );
         }
 
@@ -193,7 +196,6 @@ async fn main() -> Result<()> {
 
     // Set up feed handler with the correct data directory
     let base_path = PathBuf::from("./data");
-    assert!(base_path.exists(), "data directory does not exist");
     let mut handler = FeedHandler::new(base_path)?;
 
     // Create client to fetch markets from API

@@ -21,6 +21,15 @@ base64 = "0.22.1"
 tokio-util = "0.7.15"
 zstd = "0.13"
 chrono = "0.4"
+tempfile = "3.10"
 
 [dev-dependencies]
 anyhow = "1"
+
+[[bin]]
+name = "feed"
+path = "src/bin/feed.rs"
+
+[[bin]]
+name = "deploy"
+path = "src/bin/deploy.rs"
