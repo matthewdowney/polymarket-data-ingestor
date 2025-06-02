@@ -133,7 +133,7 @@ fn create_instance() -> Result<()> {
     // Create storage bucket
     println!("Creating storage bucket...");
     let bucket_output = Command::new("gsutil")
-        .args(&["mb", &format!("gs://{}", BUCKET_NAME)])
+        .args(["mb", &format!("gs://{}", BUCKET_NAME)])
         .output()
         .context("Failed to create bucket")?;
     
@@ -171,8 +171,8 @@ fn create_instance() -> Result<()> {
     let mut temp_file = NamedTempFile::new().context("Failed to create temporary file")?;
     temp_file.write_all(lifecycle_json.as_bytes()).context("Failed to write lifecycle configuration")?;
     
-    run_cmd(&mut Command::new("gsutil")
-        .args(&[
+    run_cmd(Command::new("gsutil")
+        .args([
             "lifecycle", "set",
             temp_file.path().to_str().unwrap(),
             &format!("gs://{}", BUCKET_NAME),
@@ -180,8 +180,8 @@ fn create_instance() -> Result<()> {
 
     // Create compute instance
     println!("Creating compute instance...");
-    run_cmd(&mut Command::new("gcloud")
-        .args(&[
+    run_cmd(Command::new("gcloud")
+        .args([
             "compute", "instances", "create", INSTANCE_NAME,
             "--zone", ZONE,
             "--machine-type", MACHINE_TYPE,
@@ -203,8 +203,8 @@ fn create_instance() -> Result<()> {
     temp_file.write_all(get_setup_script().as_bytes()).context("Failed to write setup script")?;
 
     println!("Copying setup script...");
-    run_cmd(&mut Command::new("gcloud")
-        .args(&[
+    run_cmd(Command::new("gcloud")
+        .args([
             "compute", "scp",
             temp_file.path().to_str().unwrap(),
             &format!("{}:/tmp/setup.sh", INSTANCE_NAME),
@@ -230,8 +230,8 @@ fn deploy_code() -> Result<()> {
     let mut temp_file = NamedTempFile::new().context("Failed to create temporary file")?;
     temp_file.write_all(get_setup_script().as_bytes()).context("Failed to write setup script")?;
 
-    run_cmd(&mut Command::new("gcloud")
-        .args(&[
+    run_cmd(Command::new("gcloud")
+        .args([
             "compute", "scp",
             temp_file.path().to_str().unwrap(),
             &format!("{}:/tmp/setup.sh", INSTANCE_NAME),
@@ -244,8 +244,8 @@ fn deploy_code() -> Result<()> {
     println!("Cleaning up old files and syncing source code...");
     run_cmd(&mut gcloud_ssh_cmd(&format!("sudo rm -rf /tmp/{}", SERVICE_NAME)), "Failed to clean up old files")?;
     
-    run_cmd(&mut Command::new("gcloud")
-        .args(&[
+    run_cmd(Command::new("gcloud")
+        .args([
             "compute", "scp", "--recurse",
             "src/", "Cargo.toml", "Cargo.lock",
             &format!("{}:/tmp/{}-source", INSTANCE_NAME, SERVICE_NAME),
@@ -294,8 +294,8 @@ fn destroy_instance() -> Result<()> {
     }
 
     println!("\nDestroying instance...");
-    run_cmd(&mut Command::new("gcloud")
-        .args(&[
+    run_cmd(Command::new("gcloud")
+        .args([
             "compute", "instances", "delete", INSTANCE_NAME,
             "--zone", ZONE,
             "--quiet"
@@ -312,7 +312,7 @@ fn check_status() -> Result<()> {
     println!("Checking instance status...");
     
     let status = Command::new("gcloud")
-        .args(&[
+        .args([
             "compute", "instances", "describe", INSTANCE_NAME,
             "--zone", ZONE,
             "--format", "value(status)"
@@ -346,7 +346,7 @@ fn wait_for_instance_ready() -> Result<()> {
 
     while attempts < max_attempts {
         let output = Command::new("gcloud")
-            .args(&[
+            .args([
                 "compute",
                 "instances",
                 "describe",
@@ -364,7 +364,7 @@ fn wait_for_instance_ready() -> Result<()> {
         if status == "RUNNING" {
             // Additional check to ensure SSH is ready
             let ssh_check = Command::new("gcloud")
-                .args(&[
+                .args([
                     "compute",
                     "ssh",
                     INSTANCE_NAME,
@@ -404,7 +404,7 @@ fn run_cmd(cmd: &mut Command, error_msg: &str) -> Result<()> {
 
 fn gcloud_ssh_cmd(command: &str) -> Command {
     let mut cmd = Command::new("gcloud");
-    cmd.args(&[
+    cmd.args([
         "compute",
         "ssh",
         INSTANCE_NAME,

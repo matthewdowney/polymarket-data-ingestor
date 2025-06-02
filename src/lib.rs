@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 pub mod client;
 
 /// A token represents one outcome in a prediction market.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MarketToken {
     pub outcome: String,
     pub price: f64,
@@ -56,7 +56,7 @@ pub struct MarketToken {
 
 /// A market from the Polymarket API, which may be active or inactive,
 /// past present or future.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PolymarketMarket {
     // unclear what the differences between these fields are
     pub closed: bool,

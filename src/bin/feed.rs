@@ -1,7 +1,8 @@
 use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
-use polymarket_data_ingestor::client;
+use polymarket_data_ingestor::{client, PolymarketMarket};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
@@ -12,6 +13,60 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use zstd::stream::write::Encoder;
+
+/// A framed message with timestamp and type information
+#[derive(Debug, Serialize, Deserialize)]
+struct LoggedMessage {
+    timestamp: String,
+    message_type: String,
+    content: serde_json::Value,
+}
+
+impl LoggedMessage {
+    fn new_feed_message(raw_json: &str) -> Self {
+        Self {
+            timestamp: Utc::now().to_rfc3339(),
+            message_type: "feed_message".to_string(),
+            content: serde_json::Value::String(raw_json.to_string()),
+        }
+    }
+
+    fn new_active_markets(markets: &[PolymarketMarket]) -> Self {
+        Self {
+            timestamp: Utc::now().to_rfc3339(),
+            message_type: "active_markets".to_string(),
+            content: serde_json::json!({
+                "markets": markets,
+                "count": markets.len()
+            }),
+        }
+    }
+
+    fn new_shutdown_initiated(signal: &str) -> Self {
+        Self {
+            timestamp: Utc::now().to_rfc3339(),
+            message_type: "shutdown_initiated".to_string(),
+            content: serde_json::json!({
+                "signal": signal
+            }),
+        }
+    }
+
+    fn new_all_connections_ready(connection_count: usize, markets_count: usize) -> Self {
+        Self {
+            timestamp: Utc::now().to_rfc3339(),
+            message_type: "all_connections_ready".to_string(),
+            content: serde_json::json!({
+                "connection_count": connection_count,
+                "markets_count": markets_count
+            }),
+        }
+    }
+
+    fn to_json_line(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+}
 
 /// Handles feed events with automatic hourly file rotation
 struct FeedHandler {
@@ -27,6 +82,8 @@ struct FeedHandler {
     have_all_connections_opened: bool,
     n_connections_open: usize,
     n_connections_total: usize,
+    
+    active_markets: Vec<PolymarketMarket>,
 }
 
 impl FeedHandler {
@@ -62,6 +119,7 @@ impl FeedHandler {
             have_all_connections_opened: false,
             n_connections_open: 0,
             n_connections_total: 0,
+            active_markets: Vec::new(),
         })
     }
 
@@ -116,6 +174,9 @@ impl FeedHandler {
                 filepath = %filepath.display(),
                 "created new current log file"
             );
+
+            // Emit market data as first line after rotation
+            self.emit_market_data()?;
         }
 
         Ok(())
@@ -125,13 +186,15 @@ impl FeedHandler {
         self.ensure_current_file()?;
 
         if let Some(ref mut writer) = self.current_writer {
+            // Wrap the raw message in our frame format
+            let logged_msg = LoggedMessage::new_feed_message(&msg);
+            let json_line = logged_msg.to_json_line()?;
+            
             self.msg_count += 1;
-            self.bytes_count += msg.len() as u64;
+            self.bytes_count += json_line.len() as u64;
 
-            writer.write_all(msg.as_bytes())?;
-            if !msg.is_empty() && !msg.ends_with('\n') {
-                writer.write_all(b"\n")?;
-            }
+            writer.write_all(json_line.as_bytes())?;
+            writer.write_all(b"\n")?;
 
             // Periodic flush for reliability
             if self.msg_count % 100 == 0 {
@@ -146,12 +209,59 @@ impl FeedHandler {
         Ok(())
     }
 
+    fn set_active_markets(&mut self, markets: Vec<PolymarketMarket>) -> Result<()> {
+        self.active_markets = markets;
+        self.emit_market_data()
+    }
+
+    fn emit_market_data(&mut self) -> Result<()> {
+        if !self.active_markets.is_empty() {
+            if let Some(ref mut writer) = self.current_writer {
+                let logged_msg = LoggedMessage::new_active_markets(&self.active_markets);
+                let json_line = logged_msg.to_json_line()?;
+                
+                writer.write_all(json_line.as_bytes())?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn log_shutdown_initiated(&mut self, signal: &str) -> Result<()> {
+        if let Some(ref mut writer) = self.current_writer {
+            let logged_msg = LoggedMessage::new_shutdown_initiated(signal);
+            let json_line = logged_msg.to_json_line()?;
+            
+            writer.write_all(json_line.as_bytes())?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+        }
+        Ok(())
+    }
+
+    fn log_all_connections_ready(&mut self, connection_count: usize) -> Result<()> {
+        if let Some(ref mut writer) = self.current_writer {
+            let logged_msg = LoggedMessage::new_all_connections_ready(
+                connection_count, 
+                self.active_markets.len()
+            );
+            let json_line = logged_msg.to_json_line()?;
+            
+            writer.write_all(json_line.as_bytes())?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+        }
+        Ok(())
+    }
+
     fn handle_connection_opened(&mut self, n_open: usize, n_connections: usize) -> Result<()> {
         self.n_connections_open = n_open;
         self.n_connections_total = n_connections;
         if n_open == n_connections && !self.have_all_connections_opened {
             self.have_all_connections_opened = true;
             tracing::info!(connection_count = n_connections, "all connections opened");
+            self.log_all_connections_ready(n_connections)?;
         }
         Ok(())
     }
@@ -209,12 +319,16 @@ async fn main() -> Result<()> {
         "found active markets, connecting..."
     );
 
+    // Store market data in handler and emit as first log line
+    handler.set_active_markets(markets.clone())?;
+
     // Get stream of events for these markets
     let (mut stream, client_handle) = client.into_stream(markets).await?;
 
-    // Set up signal handlers for both SIGINT and SIGTERM
+    // Set up signal handlers for SIGINT, SIGTERM, and SIGHUP
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
 
     // Process events from the stream until a stop signal is received
     loop {
@@ -237,12 +351,21 @@ async fn main() -> Result<()> {
             // Handle SIGINT (Ctrl+C)
             _ = sigint.recv() => {
                 tracing::info!("received SIGINT, shutting down gracefully...");
+                handler.log_shutdown_initiated("SIGINT")?;
                 cancel.cancel();
                 break;
             }
             // Handle SIGTERM (systemd stop)
             _ = sigterm.recv() => {
                 tracing::info!("received SIGTERM, shutting down gracefully...");
+                handler.log_shutdown_initiated("SIGTERM")?;
+                cancel.cancel();
+                break;
+            }
+            // Handle SIGHUP (hangup)
+            _ = sighup.recv() => {
+                tracing::info!("received SIGHUP, shutting down gracefully...");
+                handler.log_shutdown_initiated("SIGHUP")?;
                 cancel.cancel();
                 break;
             }
