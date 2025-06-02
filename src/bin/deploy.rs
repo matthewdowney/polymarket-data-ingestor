@@ -67,6 +67,8 @@ ExecStart={APP_DIR}/{BINARY_NAME}
 Restart=always
 RestartSec=10
 Environment=RUST_LOG=info
+# Give the service 30 seconds to shut down gracefully
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
@@ -79,7 +81,10 @@ cat >> /tmp/{USER_NAME}_cron << 'CRON_EOF'
 */10 * * * * cd {APP_DIR} && gsutil -m mv {DATA_DIR}/*.jsonl.zst gs://{BUCKET_NAME}/raw/ 2>/dev/null || true
 
 # Send metrics to Cloud Logging every 2 minutes  
-*/2 * * * * journalctl -u {SERVICE_NAME} --since '2 minutes ago' | while IFS= read -r line; dogcloud logging write {SERVICE_NAME}-{BINARY_NAME} \"$line\"; done 2>/dev/null || true
+*/2 * * * * journalctl -u {SERVICE_NAME} --since '2 minutes ago' | while IFS= read -r line; do gcloud logging write {SERVICE_NAME}-{BINARY_NAME} "$line" --payload-type=text; done 2>/dev/null || true
+
+# Restart the service every 6 hours to discover new markets
+0 */6 * * * systemctl restart {SERVICE_NAME}
 CRON_EOF
 
 crontab -u {USER_NAME} /tmp/{USER_NAME}_cron
@@ -220,22 +225,43 @@ fn create_instance() -> Result<()> {
 fn deploy_code() -> Result<()> {
     println!("Deploying code to instance...");
 
-    // Sync source code to /tmp first
-    println!("Syncing source code...");
+    // Re-run setup script first
+    println!("Re-running setup script...");
+    let mut temp_file = NamedTempFile::new().context("Failed to create temporary file")?;
+    temp_file.write_all(get_setup_script().as_bytes()).context("Failed to write setup script")?;
+
+    run_cmd(&mut Command::new("gcloud")
+        .args(&[
+            "compute", "scp",
+            temp_file.path().to_str().unwrap(),
+            &format!("{}:/tmp/setup.sh", INSTANCE_NAME),
+            "--zone", ZONE
+        ]), "Failed to copy setup script")?;
+
+    run_cmd(&mut gcloud_ssh_cmd("sudo bash /tmp/setup.sh"), "Setup script failed")?;
+
+    // Clean up old directory and sync source code
+    println!("Cleaning up old files and syncing source code...");
+    run_cmd(&mut gcloud_ssh_cmd(&format!("sudo rm -rf /tmp/{}", SERVICE_NAME)), "Failed to clean up old files")?;
+    
     run_cmd(&mut Command::new("gcloud")
         .args(&[
             "compute", "scp", "--recurse",
             "src/", "Cargo.toml", "Cargo.lock",
-            &format!("{}:/tmp/{}", INSTANCE_NAME, SERVICE_NAME),
+            &format!("{}:/tmp/{}-source", INSTANCE_NAME, SERVICE_NAME),
             "--zone", ZONE
         ]), "Failed to sync source code")?;
 
     // Move, build and deploy
-    println!("Building and deploying (first build will take up to 15 minutes)...");
+    println!("Building and deploying (first build will take up to 15 minutes on this tiny machine)...");
     let deploy_cmd = format!(
-        "sudo chown -R {user}:{user} /tmp/{service} && \
-         sudo -u {user} bash -c 'cd /tmp/{service} && source ~/.cargo/env && cargo build --release --bin {bin}' && \
-         sudo cp /tmp/{service}/target/release/{bin} {app}/ && sudo systemctl restart {service}",
+        "sudo mkdir -p /tmp/{service}-build && \
+         sudo cp -r /tmp/{service}-source/* /tmp/{service}-build/ && \
+         sudo chown -R {user}:{user} /tmp/{service}-build && \
+         sudo -u {user} bash -c 'cd /tmp/{service}-build && source ~/.cargo/env && cargo build --release --bin {bin}' && \
+         sudo systemctl stop {service} && \
+         sudo cp /tmp/{service}-build/target/release/{bin} {app}/ && \
+         sudo systemctl start {service}",
         user = USER_NAME, app = APP_DIR, bin = BINARY_NAME, service = SERVICE_NAME
     );
     run_cmd(&mut gcloud_ssh_cmd(&deploy_cmd), "Failed to build and deploy")?;

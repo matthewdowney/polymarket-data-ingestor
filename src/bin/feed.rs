@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::signal;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use zstd::stream::write::Encoder;
@@ -84,12 +84,12 @@ impl FeedHandler {
             // Close current writer if exists
             if let Some(writer) = self.current_writer.take() {
                 writer.finish()?;
-                
+
                 // Move the current file to timestamped filename
                 let old_filename = Self::get_current_hour_filename(self.current_hour_timestamp);
                 let old_filepath = self.data_dir.join(format!("{}.jsonl.zst", old_filename));
                 let current_filepath = self.current_dir.join("log.jsonl.zst");
-                
+
                 if current_filepath.exists() {
                     std::fs::rename(&current_filepath, &old_filepath)?;
                     tracing::info!(
@@ -212,7 +212,11 @@ async fn main() -> Result<()> {
     // Get stream of events for these markets
     let (mut stream, client_handle) = client.into_stream(markets).await?;
 
-    // Process events from the stream until Ctrl+C is received
+    // Set up signal handlers for both SIGINT and SIGTERM
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    // Process events from the stream until a stop signal is received
     loop {
         tokio::select! {
             event = stream.next() => {
@@ -230,9 +234,15 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            // Handle both Ctrl+C and systemd stop signals (SIGTERM)
-            _ = signal::ctrl_c() => {
-                tracing::info!("received stop signal, shutting down gracefully...");
+            // Handle SIGINT (Ctrl+C)
+            _ = sigint.recv() => {
+                tracing::info!("received SIGINT, shutting down gracefully...");
+                cancel.cancel();
+                break;
+            }
+            // Handle SIGTERM (systemd stop)
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, shutting down gracefully...");
                 cancel.cancel();
                 break;
             }
