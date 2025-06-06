@@ -1,26 +1,53 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use std::env;
+use clap::Parser;
 use std::path::PathBuf;
 
 use polymarket_data_ingestor::replay::{HistoricalDataReader, ReplayConfig};
 
+#[derive(Parser)]
+#[command(name = "replay")]
+#[command(about = "Replay historical Polymarket order book data between two timestamps.")]
+#[command(long_about = "Replay historical Polymarket order book data between two timestamps.\nOutputs JSON messages to stdout for piping to other tools.")]
+#[command(after_long_help = "TIMESTAMP FORMATS:\n  RFC3339:        2024-01-01T12:00:00Z\n  ISO (UTC):      2024-01-01T12:00:00\n  Date only:      2024-01-01 (becomes 2024-01-01T00:00:00Z)\n\nEXAMPLES:\n  # Replay one hour of data\n  replay --start 2024-01-01T12:00:00Z --end 2024-01-01T13:00:00Z\n\n  # Replay full day with custom data directory\n  replay --start 2024-01-01 --end 2024-01-02 --data-dir /path/to/data\n\n  # Filter specific markets and pipe to processor\n  replay --start 2024-01-01T12:00:00Z --end 2024-01-01T13:00:00Z \\\n    --markets market1,market2,market3 | my_processor\n\n  # Download from GCS with custom cache directory\n  replay --start 2024-01-01T12:00:00Z --end 2024-01-01T13:00:00Z \\\n    --download-from-gcs --gcs-cache-dir /tmp/replay_cache\n\n  # Use custom GCS credentials\n  replay --start 2024-01-01T12:00:00Z --end 2024-01-01T13:00:00Z \\\n    --download-from-gcs --gcs-credentials /path/to/service-account.json\n\n  # Disable automatic download (only use local files)\n  replay --start 2024-01-01T12:00:00Z --end 2024-01-01T13:00:00Z --no-auto-download")]
+struct Args {
+    /// Start timestamp (RFC3339, ISO, or YYYY-MM-DD format)
+    #[arg(long, help = "Start timestamp (RFC3339, ISO, or YYYY-MM-DD format)")]
+    start: String,
+
+    /// End timestamp (RFC3339, ISO, or YYYY-MM-DD format)
+    #[arg(long, help = "End timestamp (RFC3339, ISO, or YYYY-MM-DD format)")]
+    end: String,
+
+    /// Path to data directory (default: ./data)
+    #[arg(long, help = "Path to data directory (default: ./data)")]
+    data_dir: Option<PathBuf>,
+
+    /// Comma-separated list of market IDs to filter
+    #[arg(long, help = "Comma-separated list of market IDs to filter")]
+    markets: Option<String>,
+
+    /// Download missing files from GCS bucket (requires gcloud)
+    #[arg(long, help = "Download missing files from GCS bucket (requires gcloud)")]
+    download_from_gcs: bool,
+
+    /// Disable automatic download of missing data from GCS
+    #[arg(long, help = "Disable automatic download of missing data from GCS")]
+    no_auto_download: bool,
+
+    /// Directory for GCS cache (default: <data-dir>/gcs_cache)
+    #[arg(long, help = "Directory for GCS cache (default: <data-dir>/gcs_cache)")]
+    gcs_cache_dir: Option<PathBuf>,
+
+    /// Path to GCS credentials JSON file
+    #[arg(long, help = "Path to GCS credentials JSON file")]
+    gcs_credentials: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-    
-    // Handle help before argument length check
-    if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
-        print_usage(&args[0]);
-        return Ok(());
-    }
-    
-    if args.len() < 3 {
-        print_usage(&args[0]);
-        return Err(anyhow!("Insufficient arguments"));
-    }
-
-    let config = parse_args(&args[1..])?;
+    let args = Args::parse();
+    let config = build_config(&args)?;
     let reader = HistoricalDataReader::new(config);
     
     // Get streaming iterator in chronological order (with automatic download detection)
@@ -41,87 +68,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_args(args: &[String]) -> Result<ReplayConfig> {
-    let mut start_timestamp: Option<DateTime<Utc>> = None;
-    let mut end_timestamp: Option<DateTime<Utc>> = None;
-    let mut data_directory: Option<PathBuf> = None;
-    let mut markets_filter: Option<Vec<String>> = None;
-    let mut download_from_gcs = false;
-    let mut no_auto_download = false;
-    let mut gcs_cache_directory: Option<PathBuf> = None;
-    let mut gcs_credentials_path: Option<PathBuf> = None;
-    
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--start" => {
-                if i + 1 >= args.len() {
-                    return Err(anyhow!("--start requires a timestamp argument"));
-                }
-                start_timestamp = Some(parse_timestamp(&args[i + 1])?);
-                i += 2;
-            }
-            "--end" => {
-                if i + 1 >= args.len() {
-                    return Err(anyhow!("--end requires a timestamp argument"));
-                }
-                end_timestamp = Some(parse_timestamp(&args[i + 1])?);
-                i += 2;
-            }
-            "--data-dir" => {
-                if i + 1 >= args.len() {
-                    return Err(anyhow!("--data-dir requires a path argument"));
-                }
-                data_directory = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
-            }
-            "--markets" => {
-                if i + 1 >= args.len() {
-                    return Err(anyhow!("--markets requires a comma-separated list"));
-                }
-                markets_filter = Some(
-                    args[i + 1]
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .collect()
-                );
-                i += 2;
-            }
-            "--download-from-gcs" => {
-                download_from_gcs = true;
-                i += 1;
-            }
-            "--no-auto-download" => {
-                no_auto_download = true;
-                i += 1;
-            }
-            "--gcs-cache-dir" => {
-                if i + 1 >= args.len() {
-                    return Err(anyhow!("--gcs-cache-dir requires a path argument"));
-                }
-                gcs_cache_directory = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
-            }
-            "--gcs-credentials" => {
-                if i + 1 >= args.len() {
-                    return Err(anyhow!("--gcs-credentials requires a path argument"));
-                }
-                gcs_credentials_path = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
-            }
-            "--help" | "-h" => {
-                print_usage("replay");
-                std::process::exit(0);
-            }
-            arg => {
-                return Err(anyhow!("Unknown argument: {}", arg));
-            }
-        }
-    }
-    
-    let start = start_timestamp.ok_or_else(|| anyhow!("--start timestamp is required"))?;
-    let end = end_timestamp.ok_or_else(|| anyhow!("--end timestamp is required"))?;
-    let data_dir = data_directory.unwrap_or_else(|| PathBuf::from("./data"));
+fn build_config(args: &Args) -> Result<ReplayConfig> {
+    let start = parse_timestamp(&args.start)?;
+    let end = parse_timestamp(&args.end)?;
+    let data_dir = args.data_dir.clone().unwrap_or_else(|| PathBuf::from("./data"));
     
     if start >= end {
         return Err(anyhow!("Start timestamp must be before end timestamp"));
@@ -129,22 +79,26 @@ fn parse_args(args: &[String]) -> Result<ReplayConfig> {
     
     let mut config = ReplayConfig::new(start, end, data_dir);
     
-    if let Some(markets) = markets_filter {
-        config = config.with_markets_filter(markets);
+    if let Some(markets_str) = &args.markets {
+        let markets_filter: Vec<String> = markets_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
+        config = config.with_markets_filter(markets_filter);
     }
     
-    if no_auto_download {
+    if args.no_auto_download {
         config = config.with_no_auto_download(true);
     }
     
-    if download_from_gcs {
-        let cache_dir = gcs_cache_directory.unwrap_or_else(|| 
+    if args.download_from_gcs {
+        let cache_dir = args.gcs_cache_dir.clone().unwrap_or_else(|| 
             config.data_directory.join("gcs_cache")
         );
         config = config.with_gcs_download(cache_dir);
         
-        if let Some(creds_path) = gcs_credentials_path {
-            config = config.with_gcs_credentials(creds_path);
+        if let Some(creds_path) = &args.gcs_credentials {
+            config = config.with_gcs_credentials(creds_path.clone());
         }
     }
     
@@ -168,51 +122,4 @@ fn parse_timestamp(timestamp_str: &str) -> Result<DateTime<Utc>> {
     }
     
     Err(anyhow!("Unable to parse timestamp: {}. Supported formats: RFC3339 (2024-01-01T12:00:00Z), ISO without timezone (2024-01-01T12:00:00), or date only (2024-01-01)", timestamp_str))
-}
-
-fn print_usage(program_name: &str) {
-    println!("Usage: {} --start <timestamp> --end <timestamp> [OPTIONS]", program_name);
-    println!();
-    println!("Replay historical Polymarket order book data between two timestamps.");
-    println!("Outputs JSON messages to stdout for piping to other tools.");
-    println!();
-    println!("REQUIRED ARGUMENTS:");
-    println!("  --start <timestamp>     Start timestamp (RFC3339, ISO, or YYYY-MM-DD format)");
-    println!("  --end <timestamp>       End timestamp (RFC3339, ISO, or YYYY-MM-DD format)");
-    println!();
-    println!("OPTIONS:");
-    println!("  --data-dir <path>       Path to data directory (default: ./data)");
-    println!("  --markets <list>        Comma-separated list of market IDs to filter");
-    println!("  --download-from-gcs     Download missing files from GCS bucket (requires gcloud)");
-    println!("  --no-auto-download      Disable automatic download of missing data from GCS");
-    println!("  --gcs-cache-dir <path>  Directory for GCS cache (default: <data-dir>/gcs_cache)");
-    println!("  --gcs-credentials <path> Path to GCS credentials JSON file");
-    println!("  --help, -h              Show this help message");
-    println!();
-    println!("EXAMPLES:");
-    println!("  # Replay one hour of data");
-    println!("  {} --start 2024-01-01T12:00:00Z --end 2024-01-01T13:00:00Z", program_name);
-    println!();
-    println!("  # Replay full day with custom data directory");
-    println!("  {} --start 2024-01-01 --end 2024-01-02 --data-dir /path/to/data", program_name);
-    println!();
-    println!("  # Filter specific markets and pipe to processor");
-    println!("  {} --start 2024-01-01T12:00:00Z --end 2024-01-01T13:00:00Z \\", program_name);
-    println!("    --markets market1,market2,market3 | my_processor");
-    println!();
-    println!("  # Download from GCS with custom cache directory");
-    println!("  {} --start 2024-01-01T12:00:00Z --end 2024-01-01T13:00:00Z \\", program_name);
-    println!("    --download-from-gcs --gcs-cache-dir /tmp/replay_cache");
-    println!();
-    println!("  # Use custom GCS credentials");
-    println!("  {} --start 2024-01-01T12:00:00Z --end 2024-01-01T13:00:00Z \\", program_name);
-    println!("    --download-from-gcs --gcs-credentials /path/to/service-account.json");
-    println!();
-    println!("  # Disable automatic download (only use local files)");
-    println!("  {} --start 2024-01-01T12:00:00Z --end 2024-01-01T13:00:00Z --no-auto-download", program_name);
-    println!();
-    println!("TIMESTAMP FORMATS:");
-    println!("  RFC3339:        2024-01-01T12:00:00Z");
-    println!("  ISO (UTC):      2024-01-01T12:00:00");
-    println!("  Date only:      2024-01-01 (becomes 2024-01-01T00:00:00Z)");
 }
