@@ -6,30 +6,17 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use polymarket_data_ingestor::client::{PolymarketClient, FeedEvent};
+//! use polymarket_data_ingestor::client::PolymarketClient;
 //! use tokio_util::sync::CancellationToken;
-//! use futures::StreamExt;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let cancel = CancellationToken::new();
 //!     let client = PolymarketClient::new(cancel.clone());
 //!     
-//!     // Create a stream of events for all active markets
-//!     let mut stream = client.into_active_markets_stream().await?;
-//!     
-//!     // Process events from the stream
-//!     while let Some(event) = stream.next().await {
-//!         match event {
-//!             FeedEvent::FeedMessage(msg) => println!("Data: {}", msg),
-//!             FeedEvent::ConnectionOpened(_, open, total) => {
-//!                 println!("Connection opened ({}/{})", open, total);
-//!             }
-//!             FeedEvent::ConnectionClosed(_, open, total) => {
-//!                 println!("Connection closed ({}/{})", open, total);
-//!             }
-//!         }
-//!     }
+//!     // Fetch active markets  
+//!     let markets = client.fetch_active_markets().await?;
+//!     println!("Found {} active markets", markets.len());
 //!     
 //!     Ok(())
 //! }
@@ -40,6 +27,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 pub mod client;
+pub mod replay;
+
 
 /// A token represents one outcome in a prediction market.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -65,6 +54,7 @@ pub struct PolymarketMarket {
     pub archived: bool,
     pub enable_order_book: bool,
 
+    pub id: String,
     pub condition_id: String,
     pub question_id: String,
     pub question: String,
