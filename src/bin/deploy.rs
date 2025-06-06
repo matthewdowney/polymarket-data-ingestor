@@ -44,6 +44,10 @@ apt-get install -y build-essential pkg-config libssl-dev curl git
 # Create application directory and user first
 useradd -m -s /bin/bash {USER_NAME} || true
 
+# Add sudo permissions for the polymarket user
+echo "{USER_NAME} ALL=(ALL) NOPASSWD: /bin/systemctl restart {SERVICE_NAME}" > /etc/sudoers.d/{USER_NAME}
+chmod 440 /etc/sudoers.d/{USER_NAME}
+
 # Install Rust for the polymarket user
 sudo -u {USER_NAME} bash -c 'curl --proto '\''=https'\'' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
 mkdir -p {APP_DIR}
@@ -70,6 +74,9 @@ Environment=RUST_LOG=info
 # Give the service 30 seconds to shut down gracefully
 TimeoutStopSec=30
 
+MemoryAccounting=true
+MemoryMax=1024M
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -84,7 +91,7 @@ cat >> /tmp/{USER_NAME}_cron << 'CRON_EOF'
 */2 * * * * journalctl -u {SERVICE_NAME} --since '2 minutes ago' | while IFS= read -r line; do gcloud logging write {SERVICE_NAME}-{BINARY_NAME} "$line" --payload-type=text; done 2>/dev/null || true
 
 # Restart the service every 6 hours to discover new markets
-0 */6 * * * systemctl restart {SERVICE_NAME}
+0 */6 * * * sudo systemctl restart {SERVICE_NAME}
 CRON_EOF
 
 crontab -u {USER_NAME} /tmp/{USER_NAME}_cron
