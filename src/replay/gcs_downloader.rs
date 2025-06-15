@@ -3,10 +3,13 @@ use chrono::{DateTime, Utc};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tokio::task::JoinSet;
 
 const BUCKET_NAME: &str = "polymarket-data-bucket";
 const GCS_PREFIX: &str = "raw/";
+const BATCH_SIZE: usize = 4; // Number of files to download in parallel
 
+#[derive(Clone)]
 pub struct GcsDownloader {
     local_cache_dir: PathBuf,
 }
@@ -18,37 +21,11 @@ impl GcsDownloader {
         fs::create_dir_all(&cache_dir)?;
 
         // Check if gcloud storage is available
-        let gcloud_check = Command::new("gcloud")
-            .args(["storage", "--help"])
-            .output();
+        let gcloud_check = Command::new("gcloud").args(["storage", "--help"]).output();
 
         if gcloud_check.is_err() || !gcloud_check.unwrap().status.success() {
             return Err(anyhow!(
                 "gcloud storage command not found. Please install Google Cloud SDK and run 'gcloud auth login'"
-            ));
-        }
-
-        Ok(Self {
-            local_cache_dir: cache_dir,
-        })
-    }
-
-    /// Create a new GCS downloader with custom credentials
-    pub async fn new_with_credentials(cache_dir: PathBuf, credentials_path: PathBuf) -> Result<Self> {
-        // Create cache directory if it doesn't exist
-        fs::create_dir_all(&cache_dir)?;
-
-        // Set the credentials environment variable for gcloud
-        std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", credentials_path);
-
-        // Check if gcloud storage is available
-        let gcloud_check = Command::new("gcloud")
-            .args(["storage", "--help"])
-            .output();
-
-        if gcloud_check.is_err() || !gcloud_check.unwrap().status.success() {
-            return Err(anyhow!(
-                "gcloud storage command not found. Please install Google Cloud SDK"
             ));
         }
 
@@ -67,26 +44,59 @@ impl GcsDownloader {
         let required_files = self.get_required_files_for_range(start_time, end_time)?;
         let mut downloaded_files = Vec::new();
 
-        for file_name in required_files {
-            let local_path = self.local_cache_dir.join(&file_name);
+        // Filter out files that are already cached
+        let (cached_files, files_to_download): (Vec<_>, Vec<_>) = required_files
+            .into_iter()
+            .map(|file_name| {
+                let local_path = self.local_cache_dir.join(&file_name);
+                (file_name, local_path)
+            })
+            .partition(|(_, path)| path.exists());
 
-            // Check if file already exists locally
-            if local_path.exists() {
-                println!("Using cached file: {}", file_name);
-                downloaded_files.push(local_path);
-                continue;
-            }
+        // Add cached files to result
+        for (file_name, path) in cached_files {
+            println!("Using cached file: {}", file_name);
+            downloaded_files.push(path);
+        }
 
-            // Download the file
-            println!("Downloading: {}", file_name);
-            match self.download_file(&file_name, &local_path).await {
-                Ok(_) => {
-                    downloaded_files.push(local_path);
+        // Download remaining files in batches
+        for chunk in files_to_download.chunks(BATCH_SIZE) {
+            let batch_files = self.download_batch(chunk).await?;
+            downloaded_files.extend(batch_files);
+        }
+
+        Ok(downloaded_files)
+    }
+
+    /// Download a batch of files in parallel
+    async fn download_batch(&self, files: &[(String, PathBuf)]) -> Result<Vec<PathBuf>> {
+        let mut tasks = JoinSet::new();
+        let mut downloaded_files = Vec::new();
+
+        // Spawn tasks for each file in the batch
+        for (file_name, local_path) in files {
+            let file_name = file_name.clone();
+            let local_path = local_path.clone();
+            let self_clone = self.clone();
+
+            tasks.spawn(async move {
+                println!("Downloading: {}", file_name);
+                match self_clone.download_file(&file_name, &local_path).await {
+                    Ok(_) => Ok(local_path),
+                    Err(e) => {
+                        eprintln!("Warning: Failed to download {}: {}", file_name, e);
+                        Err(e)
+                    }
                 }
-                Err(e) => {
-                    eprintln!("Warning: Failed to download {}: {}", file_name, e);
-                    // Continue with other files - some files might not exist
-                }
+            });
+        }
+
+        // Wait for all downloads in this batch to complete
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok(path)) => downloaded_files.push(path),
+                Ok(Err(e)) => eprintln!("Warning: Download task failed: {}", e),
+                Err(e) => eprintln!("Warning: Download task panicked: {}", e),
             }
         }
 
@@ -131,100 +141,13 @@ impl GcsDownloader {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("not found") || stderr.contains("does not exist") || stderr.contains("No such object") {
+            if stderr.contains("not found")
+                || stderr.contains("does not exist")
+                || stderr.contains("No such object")
+            {
                 return Err(anyhow!("File not found in GCS: {}", file_name));
             } else {
                 return Err(anyhow!("GCS download failed: {}", stderr));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// List available files in the GCS bucket for debugging/discovery
-    pub async fn list_available_files(&self, prefix: Option<&str>) -> Result<Vec<String>> {
-        let gcs_pattern = match prefix {
-            Some(p) => format!("gs://{}/{}{}", BUCKET_NAME, GCS_PREFIX, p),
-            None => format!("gs://{}/{}**", BUCKET_NAME, GCS_PREFIX),
-        };
-
-        let output = Command::new("gcloud")
-            .args(["storage", "ls", &gcs_pattern])
-            .output()
-            .map_err(|e| anyhow!("Failed to run gcloud storage ls: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("GCS list failed: {}", stderr));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut file_names = Vec::new();
-
-        for line in stdout.lines() {
-            if let Some(file_name) = line.strip_prefix(&format!("gs://{}/{}", BUCKET_NAME, GCS_PREFIX)) {
-                if !file_name.is_empty() && !file_name.ends_with('/') {
-                    file_names.push(file_name.to_string());
-                }
-            }
-        }
-
-        Ok(file_names)
-    }
-
-    /// Clean up old cached files (older than specified days)
-    pub async fn cleanup_old_cache(&self, days_old: u64) -> Result<()> {
-        let cutoff_time = std::time::SystemTime::now() - std::time::Duration::from_secs(days_old * 24 * 60 * 60);
-
-        let entries = fs::read_dir(&self.local_cache_dir)?;
-        let mut files_removed = 0;
-
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "zst") {
-                let metadata = fs::metadata(&path)?;
-                
-                if let Ok(modified) = metadata.modified() {
-                    if modified < cutoff_time {
-                        if let Err(e) = fs::remove_file(&path) {
-                            eprintln!("Failed to remove old cache file {:?}: {}", path, e);
-                        } else {
-                            files_removed += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        if files_removed > 0 {
-            println!("Cleaned up {} old cache files", files_removed);
-        }
-
-        Ok(())
-    }
-
-    /// Get the local cache directory path
-    pub fn cache_dir(&self) -> &Path {
-        &self.local_cache_dir
-    }
-
-    /// Check if gcloud storage is properly configured and authenticated
-    pub async fn check_authentication(&self) -> Result<()> {
-        let output = Command::new("gcloud")
-            .args(["storage", "ls", &format!("gs://{}", BUCKET_NAME)])
-            .output()
-            .map_err(|e| anyhow!("Failed to run gcloud storage: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("Anonymous caller") || stderr.contains("authentication") || stderr.contains("not authenticated") {
-                return Err(anyhow!(
-                    "Not authenticated with Google Cloud. Please run 'gcloud auth login' or set GOOGLE_APPLICATION_CREDENTIALS"
-                ));
-            } else {
-                return Err(anyhow!("Failed to access GCS bucket: {}", stderr));
             }
         }
 
