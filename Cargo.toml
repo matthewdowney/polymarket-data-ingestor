@@ -36,5 +36,5 @@ name = "deploy"
 path = "src/bin/deploy.rs"
 
 [[bin]]
-name = "replay"
-path = "src/bin/replay.rs"
+name = "cli"
+path = "src/bin/cli.rs"

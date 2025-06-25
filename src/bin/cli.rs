@@ -1,14 +1,29 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, DurationRound, Utc};
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
 use polymarket_data_ingestor::replay::HistoricalDataReader;
 
 #[derive(Parser)]
-#[command(name = "replay")]
-/// Download historical Polymarket order book data for a given timefram.
+#[command(name = "cli")]
+/// Polymarket historical data download and replay tools
 struct Args {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Download data for a given timeframe
+    Download(DownloadArgs),
+    /// Replay raw messages and generate tick data
+    Replay(ReplayArgs),
+}
+
+#[derive(Parser)]
+/// Download data for a given timeframe
+struct DownloadArgs {
     /// A duration string in hours or days (e.g. "12h", "2d")
     #[arg(long, short = 't')]
     since: Option<String>,
@@ -26,15 +41,27 @@ struct Args {
     data_dir: Option<PathBuf>,
 }
 
+#[derive(Parser)]
+/// Replay raw messages and generate tick data
+struct ReplayArgs {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    match &args.command {
+        Commands::Download(download_args) => run_download(download_args).await,
+        Commands::Replay(replay_args) => run_replay(replay_args).await,
+    }
+}
+
+async fn run_download(args: &DownloadArgs) -> Result<()> {
     if args.since.is_none() && args.start.is_none() && args.end.is_none() {
-        let _ = Args::command().print_help();
+        let _ = DownloadArgs::command().print_help();
         std::process::exit(1);
     }
 
-    let (start, end) = parse_time_range(&args)?;
+    let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
 
     let data_dir = args
         .data_dir
@@ -53,8 +80,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_time_range(args: &Args) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    if let Some(since) = &args.since {
+async fn run_replay(_args: &ReplayArgs) -> Result<()> {
+    // TODO: Implement replay functionality
+    println!("Replay functionality not yet implemented");
+    Ok(())
+}
+
+fn parse_time_range(
+    since: Option<String>,
+    start: Option<String>,
+    end: Option<String>,
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    if let Some(since) = since {
         let duration = if since.ends_with("h") {
             let hours = since.trim_end_matches("h").parse::<i64>()?;
             chrono::Duration::hours(hours)
@@ -71,20 +108,12 @@ fn parse_time_range(args: &Args) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
         return Ok((start, end));
     }
 
-    let start = args
-        .start
-        .as_ref()
-        .map(|s| parse_timestamp(s))
-        .expect("start is required")?;
-    let end = args
-        .end
-        .as_ref()
-        .map(|s| parse_timestamp(s))
-        .expect("end is required")?;
+    let start = start.map(|s| parse_ts(&s)).expect("start required")?;
+    let end = end.map(|s| parse_ts(&s)).expect("end required")?;
     Ok((start, end))
 }
 
-fn parse_timestamp(timestamp_str: &str) -> Result<DateTime<Utc>> {
+fn parse_ts(timestamp_str: &str) -> Result<DateTime<Utc>> {
     // Try parsing RFC3339 format first
     if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp_str) {
         return Ok(dt.with_timezone(&Utc));
