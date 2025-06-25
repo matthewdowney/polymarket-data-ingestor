@@ -54,7 +54,7 @@ pub struct PolymarketMarket {
     pub archived: bool,
     pub enable_order_book: bool,
 
-    pub id: String,
+    pub id: Option<String>,
     pub condition_id: String,
     pub question_id: String,
     pub question: String,
