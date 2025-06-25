@@ -38,7 +38,7 @@ impl HistoricalDataReader {
             .download_for_time_range(self.start_timestamp, self.end_timestamp)
             .await?;
 
-        println!("Downloaded {} files from GCS", downloaded_files.len());
+        println!("have {} matching files", downloaded_files.len());
         Ok(())
     }
 

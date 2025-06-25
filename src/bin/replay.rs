@@ -1,31 +1,25 @@
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
-use clap::Parser;
+use chrono::{DateTime, DurationRound, Utc};
+use clap::{CommandFactory, Parser};
 use std::path::PathBuf;
 
 use polymarket_data_ingestor::replay::HistoricalDataReader;
 
 #[derive(Parser)]
 #[command(name = "replay")]
-#[command(about = "Download historical Polymarket order book data between two timestamps.")]
-#[command(
-    long_about = "Download historical Polymarket order book data between two timestamps. Outputs the list of files to stdout for piping to other tools."
-)]
+/// Download historical Polymarket order book data for a given timefram.
 struct Args {
+    /// A duration string in hours or days (e.g. "12h", "2d")
+    #[arg(long, short = 't')]
+    since: Option<String>,
+
     /// Start timestamp (RFC3339, ISO, or YYYY-MM-DD format)
-    #[arg(long, help = "Start timestamp (RFC3339, ISO, or YYYY-MM-DD format)")]
-    start: String,
+    #[arg(long)]
+    start: Option<String>,
 
     /// End timestamp (RFC3339, ISO, or YYYY-MM-DD format)
-    #[arg(long, help = "End timestamp (RFC3339, ISO, or YYYY-MM-DD format)")]
-    end: String,
-
-    /// Download missing files from GCS bucket (requires gcloud)
-    #[arg(
-        long,
-        help = "Download missing files from GCS bucket (requires gcloud) (default: true)"
-    )]
-    download_from_gcs: Option<bool>,
+    #[arg(long)]
+    end: Option<String>,
 
     /// Path to data directory (default: ./data)
     #[arg(long, help = "Path to data directory (default: ./data)")]
@@ -35,18 +29,20 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let start = parse_timestamp(&args.start)?;
-    let end = parse_timestamp(&args.end)?;
+    if args.since.is_none() && args.start.is_none() && args.end.is_none() {
+        let _ = Args::command().print_help();
+        std::process::exit(1);
+    }
+
+    let (start, end) = parse_time_range(&args)?;
+
     let data_dir = args
         .data_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("./data"));
     let cache_dir = data_dir.join("gcs_cache");
     let reader = HistoricalDataReader::new(cache_dir, start, end);
-
-    if args.download_from_gcs.unwrap_or(true) {
-        reader.download_from_gcs().await?;
-    }
+    reader.download_from_gcs().await?;
 
     // Discover files in cache directory
     let files = reader.discover_files_with_gcs_cache()?;
@@ -55,6 +51,37 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_time_range(args: &Args) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    if let Some(since) = &args.since {
+        let duration = if since.ends_with("h") {
+            let hours = since.trim_end_matches("h").parse::<i64>()?;
+            chrono::Duration::hours(hours)
+        } else if since.ends_with("d") {
+            let days = since.trim_end_matches("d").parse::<i64>()?;
+            chrono::Duration::days(days)
+        } else {
+            return Err(anyhow!("Invalid duration string: {}", since));
+        };
+
+        let end =
+            Utc::now().duration_trunc(chrono::Duration::hours(1))? - chrono::Duration::minutes(1);
+        let start = Utc::now() - duration;
+        return Ok((start, end));
+    }
+
+    let start = args
+        .start
+        .as_ref()
+        .map(|s| parse_timestamp(s))
+        .expect("start is required")?;
+    let end = args
+        .end
+        .as_ref()
+        .map(|s| parse_timestamp(s))
+        .expect("end is required")?;
+    Ok((start, end))
 }
 
 fn parse_timestamp(timestamp_str: &str) -> Result<DateTime<Utc>> {

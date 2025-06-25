@@ -54,8 +54,7 @@ impl GcsDownloader {
             .partition(|(_, path)| path.exists());
 
         // Add cached files to result
-        for (file_name, path) in cached_files {
-            println!("Using cached file: {}", file_name);
+        for (_file_name, path) in cached_files {
             downloaded_files.push(path);
         }
 
