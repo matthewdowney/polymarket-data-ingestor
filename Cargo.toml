@@ -1,9 +1,11 @@
-[package]
-name = "polymarket-data-ingestor"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = [
+    "collector",
+    "cli",
+    "deploy",
+]
 
-[dependencies]
+[workspace.dependencies]
 reqwest = { version = "0.11", features = ["json", "gzip"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 serde = { version = "1", features = ["derive"] }
@@ -23,18 +25,3 @@ zstd = "0.13"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.10"
 clap = { version = "4", features = ["derive"] }
-
-[dev-dependencies]
-anyhow = "1"
-
-[[bin]]
-name = "feed"
-path = "src/bin/feed.rs"
-
-[[bin]]
-name = "deploy"
-path = "src/bin/deploy.rs"
-
-[[bin]]
-name = "cli"
-path = "src/bin/cli.rs"

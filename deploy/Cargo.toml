@@ -1,0 +1,12 @@
+[package]
+name = "deploy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "deploy"
+path = "src/main.rs" 

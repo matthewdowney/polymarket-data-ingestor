@@ -27,7 +27,6 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 pub mod client;
-pub mod replay;
 
 
 /// A token represents one outcome in a prediction market.

@@ -27,7 +27,7 @@ const APP_DIR: &str = "/opt/pdi";
 const DATA_DIR: &str = "/opt/pdi/data";
 
 /// Name of the binary to build (match a target in Cargo.toml)
-const BINARY_NAME: &str = "feed";
+const BINARY_NAME: &str = "collector";
 
 fn get_setup_script() -> String {
     format!(

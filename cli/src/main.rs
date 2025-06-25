@@ -3,7 +3,8 @@ use chrono::{DateTime, DurationRound, Utc};
 use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
-use polymarket_data_ingestor::replay::HistoricalDataReader;
+mod replay;
+use crate::replay::HistoricalDataReader;
 
 #[derive(Parser)]
 #[command(name = "cli")]
@@ -43,7 +44,23 @@ struct DownloadArgs {
 
 #[derive(Parser)]
 /// Replay raw messages and generate tick data
-struct ReplayArgs {}
+struct ReplayArgs {
+    /// A duration string in hours or days (e.g. "12h", "2d")
+    #[arg(long, short = 't')]
+    since: Option<String>,
+
+    /// Start timestamp (RFC3339, ISO, or YYYY-MM-DD format)
+    #[arg(long)]
+    start: Option<String>,
+
+    /// End timestamp (RFC3339, ISO, or YYYY-MM-DD format)
+    #[arg(long)]
+    end: Option<String>,
+
+    /// Path to the output CSV file (defaults to stdout)
+    #[arg(long, short)]
+    output: Option<PathBuf>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -60,7 +77,6 @@ async fn run_download(args: &DownloadArgs) -> Result<()> {
         let _ = DownloadArgs::command().print_help();
         std::process::exit(1);
     }
-
     let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
 
     let data_dir = args
@@ -80,7 +96,13 @@ async fn run_download(args: &DownloadArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_replay(_args: &ReplayArgs) -> Result<()> {
+async fn run_replay(args: &ReplayArgs) -> Result<()> {
+    if args.since.is_none() && args.start.is_none() && args.end.is_none() {
+        let _ = DownloadArgs::command().print_help();
+        std::process::exit(1);
+    }
+    let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
+
     // TODO: Implement replay functionality
     println!("Replay functionality not yet implemented");
     Ok(())

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
+use data_collector::{client, PolymarketMarket};
 use futures::StreamExt;
-use polymarket_data_ingestor::{client, PolymarketMarket};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -82,7 +82,7 @@ struct FeedHandler {
     have_all_connections_opened: bool,
     n_connections_open: usize,
     n_connections_total: usize,
-    
+
     active_markets: Vec<PolymarketMarket>,
 }
 
@@ -189,7 +189,7 @@ impl FeedHandler {
             // Wrap the raw message in our frame format
             let logged_msg = LoggedMessage::new_feed_message(&msg);
             let json_line = logged_msg.to_json_line()?;
-            
+
             self.msg_count += 1;
             self.bytes_count += json_line.len() as u64;
 
@@ -219,7 +219,7 @@ impl FeedHandler {
             if let Some(ref mut writer) = self.current_writer {
                 let logged_msg = LoggedMessage::new_active_markets(&self.active_markets);
                 let json_line = logged_msg.to_json_line()?;
-                
+
                 writer.write_all(json_line.as_bytes())?;
                 writer.write_all(b"\n")?;
                 writer.flush()?;
@@ -232,7 +232,7 @@ impl FeedHandler {
         if let Some(ref mut writer) = self.current_writer {
             let logged_msg = LoggedMessage::new_shutdown_initiated(signal);
             let json_line = logged_msg.to_json_line()?;
-            
+
             writer.write_all(json_line.as_bytes())?;
             writer.write_all(b"\n")?;
             writer.flush()?;
@@ -243,11 +243,11 @@ impl FeedHandler {
     fn log_all_connections_ready(&mut self, connection_count: usize) -> Result<()> {
         if let Some(ref mut writer) = self.current_writer {
             let logged_msg = LoggedMessage::new_all_connections_ready(
-                connection_count, 
-                self.active_markets.len()
+                connection_count,
+                self.active_markets.len(),
             );
             let json_line = logged_msg.to_json_line()?;
-            
+
             writer.write_all(json_line.as_bytes())?;
             writer.write_all(b"\n")?;
             writer.flush()?;
