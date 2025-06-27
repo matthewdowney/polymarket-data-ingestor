@@ -1,52 +1,50 @@
 # Polymarket Data Ingestor
 
-A library for streaming and recording Polymarket's order book data for all active markets.
+Code for streaming, recording, and replaying Polymarket order book data.
 
-Discovers all live markets and manages as many WebSocket connections as needed to stream book data for all of them to a single channel. Handles reconnects and backoff.
+## Overview
 
-## Usage
+Three Rust binaries, each handling a different part of the data pipeline.
 
-See the crate documentation for complete examples and API reference.
+- `./collector` Core data collection service. Discovers live markets, manages WebSocket connections, streams order book data, logs raw messages with timestamps to compressed files, rotates logs hourly.
 
-## Examples
+- `./deploy` GCP automation. Creates compute instances, sets up storage buckets, configures systemd services and cron jobs, handles code deployment, manages automatic log uploads.
 
-Run the included examples:
+- `./cli` Historical data tools. Downloads from GCS, replays raw messages to reconstruct order books, generates tick data (trades and BBO updates) as CSV.
+
+## Running locally
 
 ```bash
-# Real-time order book feed for every live market
-cargo run --bin feed
+# Stream real-time data
+cargo run --bin collector
+
+# Download historical data
+cargo run --bin cli -- download --since 24h
+
+# Generate tick data in CSV format
+cargo run --bin cli -- replay --since 12h
+```
+
+## Deploying to GCP
+
+```bash
+# Setup
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+cargo run --bin deploy -- create
+
+# Deploy updates
+cargo run --bin deploy -- update
+
+# Print recent logs from the container, show SSH command
+cargo run --bin deploy -- status
 ```
 
 ## Testing
 
-To run integration tests which will fetch markets and spin up some connections:
 ```bash
 cargo test -- --ignored
 ```
-
-
-# Deploy 
-
-To record data to a GCS bucket, the deploy.rs script:
-
-1. Sets up one bucket and one VM
-2. Configures the VM to run the feed binary
-3. Periodically uploads feed logs to the bucket
-
-To deploy, customize the bucket const in `src/bin/deploy.rs` and:
-
-    # 1. Setup (once)
-    gcloud auth login
-    gcloud config set project YOUR_PROJECT_ID
-    
-    # Create instance and configure
-    cargo run --bin deploy -- create
-
-    # 2. Deploy updates
-    cargo run --bin deploy -- update
-    
-    # 3. Check status
-    cargo run --bin deploy -- status
 
 ## License
 
