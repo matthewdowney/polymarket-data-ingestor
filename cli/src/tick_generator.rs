@@ -1,22 +1,35 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    error::Error,
     fs::File,
     io::{BufRead, BufReader, Write},
+    path::PathBuf,
 };
 
-use rust_decimal::{Decimal};
+use anyhow::Result;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-pub fn main() -> Result<(), Box<dyn Error>> {
-    let mut path = std::env::args().nth(1).ok_or("need file as arg")?;
+pub fn main() -> Result<()> {
+    let path = std::env::args()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("need file as arg"))?;
+    let from_path = PathBuf::from(path);
+    let to_path = from_path.with_extension("csv");
 
-    // Decompress and read the file, keeping track of market state, and write data points as CSV
-    let mut reader = BufReader::new(zstd::Decoder::new(File::open(path.clone())?)?);
     let mut state = MarketState::default();
+    let mut writer = csv::Writer::from_writer(File::create(to_path)?);
+    write_ticks(&from_path, &mut state, &mut writer)?;
 
-    path.push_str(".csv");
-    let mut writer = csv::Writer::from_writer(File::create(path)?);
+    Ok(())
+}
+
+/// Decompress and read the file, keeping track of market state, and write data points as CSV
+pub fn write_ticks<W: Write>(
+    from_path: &PathBuf,
+    state: &mut MarketState,
+    writer: &mut csv::Writer<W>,
+) -> Result<()> {
+    let mut reader = BufReader::new(zstd::Decoder::new(File::open(from_path.clone())?)?);
 
     let mut line = String::new();
     loop {
@@ -37,7 +50,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
         // Update the market state for each feed message
         for msg in msgs {
-            state.update(msg, &mut writer)?;
+            state.update(msg, writer)?;
         }
     }
 
@@ -72,7 +85,7 @@ impl Row {
 
 /// Market state is updated with each message from the feed
 #[derive(Default)]
-struct MarketState {
+pub struct MarketState {
     /// Asset id to order book
     books: HashMap<String, Book>,
 }
@@ -133,7 +146,7 @@ impl Book {
         timestamp: String,
         market: String,
         asset: String,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<()> {
         let (px, sz) = self.top(Side::Ask);
         let row = Row {
             timestamp: timestamp.clone(),
@@ -164,11 +177,7 @@ impl Book {
 
 impl MarketState {
     /// Update the market state, write zero or more tick data rows with the writer
-    fn update<W: Write>(
-        &mut self,
-        m: FeedMessage,
-        w: &mut csv::Writer<W>,
-    ) -> Result<(), Box<dyn Error>> {
+    fn update<W: Write>(&mut self, m: FeedMessage, w: &mut csv::Writer<W>) -> Result<()> {
         match m {
             FeedMessage::LastTradePrice(x) => {
                 w.serialize(Row::from_trade(x))?;

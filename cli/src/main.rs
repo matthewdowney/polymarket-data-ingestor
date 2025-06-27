@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, DurationRound, Utc};
 use clap::{CommandFactory, Parser, Subcommand};
+use cli::file_reader::HistoricalDataReader;
 use std::path::PathBuf;
 
-mod replay;
-use crate::replay::HistoricalDataReader;
+/// Directory where raw feed logs are cached
+const DATA_DIR: &str = "./data/gcs_cache";
 
 #[derive(Parser)]
 #[command(name = "cli")]
@@ -36,10 +37,6 @@ struct DownloadArgs {
     /// End timestamp (RFC3339, ISO, or YYYY-MM-DD format)
     #[arg(long)]
     end: Option<String>,
-
-    /// Path to data directory (default: ./data)
-    #[arg(long, help = "Path to data directory (default: ./data)")]
-    data_dir: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -79,11 +76,7 @@ async fn run_download(args: &DownloadArgs) -> Result<()> {
     }
     let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
 
-    let data_dir = args
-        .data_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("./data"));
-    let cache_dir = data_dir.join("gcs_cache");
+    let cache_dir = PathBuf::from(DATA_DIR);
     let reader = HistoricalDataReader::new(cache_dir, start, end);
     reader.download_from_gcs().await?;
 
@@ -101,10 +94,21 @@ async fn run_replay(args: &ReplayArgs) -> Result<()> {
         let _ = DownloadArgs::command().print_help();
         std::process::exit(1);
     }
-    let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
 
-    // TODO: Implement replay functionality
-    println!("Replay functionality not yet implemented");
+    let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
+    let cache_dir = PathBuf::from(DATA_DIR);
+    let reader = HistoricalDataReader::new(cache_dir, start, end);
+
+    // Read the files in order, keep track of market state, and write ticks to the output file
+    let mut state = cli::tick_generator::MarketState::default();
+    let mut writer = csv::Writer::from_writer(std::io::stdout());
+
+    // Discover files in cache directory
+    let files = reader.discover_files_with_gcs_cache()?;
+    for file in files {
+        cli::tick_generator::write_ticks(&file, &mut state, &mut writer)?;
+    }
+
     Ok(())
 }
 
