@@ -23,6 +23,27 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
+pub fn read_market_info(from_path: &PathBuf) -> Result<serde_json::Value> {
+    let mut reader = BufReader::new(zstd::Decoder::new(File::open(from_path.clone())?)?);
+
+    let mut line = String::new();
+    loop {
+        // Read next JSONL
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+
+        // Decode the frame and check if it contains feed messages or if we should skip
+        let frame: MessageFrame = serde_json::from_str(&line)?;
+        if frame.message_type == "active_markets" {
+            return Ok(frame.content);
+        }
+    }
+
+    Err(anyhow::anyhow!("no active_markets message found"))
+}
+
 /// Decompress and read the file, keeping track of market state, and write data points as CSV
 pub fn write_ticks<W: Write>(
     from_path: &PathBuf,

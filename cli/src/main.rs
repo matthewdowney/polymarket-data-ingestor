@@ -2,10 +2,23 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, DurationRound, Utc};
 use clap::{CommandFactory, Parser, Subcommand};
 use cli::file_reader::HistoricalDataReader;
-use std::{io::Write, path::PathBuf};
+use data_collector::PolymarketMarket;
+use std::{
+    io::{BufReader, IsTerminal, Write},
+    path::PathBuf,
+};
 
 /// Directory where raw feed logs are cached
 const DATA_DIR: &str = "./data/gcs_cache";
+
+/// Terminal color codes - empty strings if not outputting to terminal
+fn get_colors() -> (&'static str, &'static str, &'static str) {
+    if std::io::stdout().is_terminal() {
+        ("\x1b[90m", "\x1b[32m", "\x1b[0m") // gray, green, reset
+    } else {
+        ("", "", "") // no colors when piped
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "cli")]
@@ -21,6 +34,8 @@ enum Commands {
     Download(DownloadArgs),
     /// Replay raw messages and generate tick data
     Replay(ReplayArgs),
+    /// Print information about the listed markets
+    Markets(MarketsArgs),
 }
 
 #[derive(Parser)]
@@ -59,6 +74,30 @@ struct ReplayArgs {
     output: Option<String>,
 }
 
+#[derive(Parser)]
+/// Print information about the listed markets
+struct MarketsArgs {
+    /// How long ago to query market info from (e.g. "12h", "2d")
+    #[arg(long, short = 't')]
+    since: Option<String>,
+
+    /// Date on which to query market info (RFC3339, ISO, or YYYY-MM-DD format)
+    #[arg(long)]
+    start: Option<String>,
+
+    /// Optional market name filter (case-insensitive)
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// Print raw JSON (default: false)
+    #[arg(long, default_value_t = false)]
+    raw: bool,
+
+    /// Print as CSV (default: false)
+    #[arg(long, default_value_t = false)]
+    csv: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -66,6 +105,7 @@ async fn main() -> Result<()> {
     match &args.command {
         Commands::Download(download_args) => run_download(download_args).await,
         Commands::Replay(replay_args) => run_replay(replay_args).await,
+        Commands::Markets(markets_args) => run_markets(markets_args).await,
     }
 }
 
@@ -115,6 +155,77 @@ async fn run_replay(args: &ReplayArgs) -> Result<()> {
         cli::tick_generator::write_ticks(&file, &mut state, &mut writer)?;
     }
 
+    Ok(())
+}
+
+async fn run_markets(args: &MarketsArgs) -> Result<()> {
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let start = args.start.clone().unwrap_or("1970-01-01".to_string());
+
+    let (start, end) = parse_time_range(args.since.clone(), Some(start), Some(today))?;
+    let cache_dir = PathBuf::from(DATA_DIR);
+    let reader = HistoricalDataReader::new(cache_dir, start, end);
+
+    // Use first file in range if provided, otherwise use most recent file
+    let files = reader.discover_files_with_gcs_cache()?;
+    let file = if args.since.is_none() && args.start.is_none() {
+        files.into_iter().rev().next()
+    } else {
+        files.into_iter().next()
+    };
+
+    if let Some(file) = file {
+        let msg = cli::tick_generator::read_market_info(&file)?;
+        if args.raw {
+            println!("{}", serde_json::to_string(&msg)?);
+        } else {
+            print_markets(msg, args)?;
+        }
+    } else {
+        eprintln!(
+            "No data files found in time range -- use the `download` command to download data"
+        );
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn print_markets(mut msg: serde_json::Value, args: &MarketsArgs) -> Result<()> {
+    let (gray, green, reset) = get_colors();
+    let markets = msg
+        .get_mut("markets")
+        .ok_or(anyhow!("no markets field found"))?
+        .take();
+    let markets: Vec<PolymarketMarket> = serde_json::from_value(markets)?;
+    if args.csv {
+        println!("question,question_id,outcome,token_id");
+    }
+    for market in markets {
+        if let Some(filter) = args.filter.as_ref() {
+            if !market
+                .question
+                .to_lowercase()
+                .contains(&filter.to_lowercase())
+            {
+                continue;
+            }
+        }
+        if args.csv {
+            for token in market.tokens {
+                println!(
+                    "{},{},{},{}",
+                    market.question, market.question_id, token.outcome, token.token_id
+                );
+            }
+        } else {
+            println!("  {}{}{}", gray, market.question_id, reset);
+            for token in market.tokens {
+                print!("  {}{:<10}{}", green, token.outcome, reset);
+                println!("  {}{}{}", gray, token.token_id, reset);
+            }
+        }
+    }
     Ok(())
 }
 
