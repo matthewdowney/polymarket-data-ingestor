@@ -4,7 +4,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use cli::file_reader::HistoricalDataReader;
 use data_collector::PolymarketMarket;
 use std::{
-    io::{BufReader, IsTerminal, Write},
+    io::{IsTerminal, Write},
     path::PathBuf,
 };
 
@@ -72,11 +72,18 @@ struct ReplayArgs {
     /// Path to the output CSV file (defaults to stdout)
     #[arg(long, short)]
     output: Option<String>,
+
+    /// Specific market ids to replay (can be specified multiple times)
+    #[arg(long, short = 'm', num_args = 1..)]
+    markets: Option<Vec<String>>,
 }
 
 #[derive(Parser)]
 /// Print information about the listed markets
 struct MarketsArgs {
+    /// Optional market name filter (case-insensitive)
+    filter: Option<String>,
+
     /// How long ago to query market info from (e.g. "12h", "2d")
     #[arg(long, short = 't')]
     since: Option<String>,
@@ -84,10 +91,6 @@ struct MarketsArgs {
     /// Date on which to query market info (RFC3339, ISO, or YYYY-MM-DD format)
     #[arg(long)]
     start: Option<String>,
-
-    /// Optional market name filter (case-insensitive)
-    #[arg(long)]
-    filter: Option<String>,
 
     /// Print raw JSON (default: false)
     #[arg(long, default_value_t = false)]
@@ -141,6 +144,9 @@ async fn run_replay(args: &ReplayArgs) -> Result<()> {
 
     // Read the files in order, keep track of market state, and write ticks to the output file
     let mut state = cli::tick_generator::MarketState::default();
+    if let Some(markets) = args.markets.clone() {
+        state.with_market_filter(markets);
+    }
 
     let out: Box<dyn Write> = if let Some(output) = args.output.clone() {
         Box::new(std::fs::File::create(output)?)
@@ -219,7 +225,8 @@ fn print_markets(mut msg: serde_json::Value, args: &MarketsArgs) -> Result<()> {
                 );
             }
         } else {
-            println!("  {}{}{}", gray, market.question_id, reset);
+            println!("{}", market.question);
+            println!("  {}{}{}", gray, market.condition_id, reset);
             for token in market.tokens {
                 print!("  {}{:<10}{}", green, token.outcome, reset);
                 println!("  {}{}{}", gray, token.token_id, reset);

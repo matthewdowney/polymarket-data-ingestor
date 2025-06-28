@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
@@ -109,6 +109,9 @@ impl Row {
 pub struct MarketState {
     /// Asset id to order book
     books: HashMap<String, Book>,
+
+    /// Market ids to replay
+    market_ids: Option<HashSet<String>>,
 }
 
 /// Limit order book
@@ -201,9 +204,22 @@ impl MarketState {
     fn update<W: Write>(&mut self, m: FeedMessage, w: &mut csv::Writer<W>) -> Result<()> {
         match m {
             FeedMessage::LastTradePrice(x) => {
+                // Skip if market id is not in the filter
+                if let Some(market_ids) = &self.market_ids {
+                    if !market_ids.contains(&x.market) {
+                        return Ok(());
+                    }
+                }
                 w.serialize(Row::from_trade(x))?;
             }
             FeedMessage::BookSnapshot(x) => {
+                // Skip if market id is not in the filter
+                if let Some(market_ids) = &self.market_ids {
+                    if !market_ids.contains(&x.market) {
+                        return Ok(());
+                    }
+                }
+
                 self.books
                     .entry(x.asset_id.clone())
                     .or_default()
@@ -211,6 +227,13 @@ impl MarketState {
                     .write_bbo(w, x.timestamp, x.market, x.asset_id)?;
             }
             FeedMessage::BookDiff(x) => {
+                // Skip if market id is not in the filter
+                if let Some(market_ids) = &self.market_ids {
+                    if !market_ids.contains(&x.market) {
+                        return Ok(());
+                    }
+                }
+
                 self.books
                     .entry(x.asset_id.clone())
                     .or_default()
@@ -220,6 +243,10 @@ impl MarketState {
             FeedMessage::Other => {}
         }
         Ok(())
+    }
+
+    pub fn with_market_filter(&mut self, markets: Vec<String>) {
+        self.market_ids = Some(markets.into_iter().collect());
     }
 }
 

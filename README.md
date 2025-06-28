@@ -14,6 +14,8 @@ Three Rust binaries, each handling a different part of the data pipeline.
 
 ## Running locally
 
+Requires [gcloud](https://cloud.google.com/sdk/docs/install) cli installed and authenticated.
+
 ```bash
 # Stream real-time data
 cargo run --bin collector
@@ -45,6 +47,31 @@ cargo run --bin deploy -- status
 ```bash
 cargo test -- --ignored
 ```
+
+## Research workflow
+
+Download a day of data:
+
+    cargo run --release --bin cli -- download -t 24h
+
+Generate tick data from the feed logs:
+
+    cargo run --release --bin cli -- replay -t 24h -o ticks.csv
+
+Use the CLI to find market and asset ids:
+
+    cargo run --release --bin cli -- markets "Will Iran close"
+
+    Will Iran close the Strait of Hormuz in 2025?
+        0x89ff77ee1c11d6c8a480bfaab11eefd6f87b8f2076a065be0706453857dc0958
+        Yes         108468416668663017133298741485453125150952822149773262784582671647441799250111
+        No          47757079633894387112291987083810225642258238114957712348556688720736895499502
+    Will Iran close the Strait of Hormuz before July?
+        0x0f4d9792bdf45a5fa5f717cbe55d78107878854816374b2dd741f46062aba2b0
+        Yes         8717238053971684305673538480906460309461104157416047071886876622775788196994
+        No          70227207630366498561631268042608657578076339758646274683548012561150704284965
+
+Load ticks in a notebook (see [./notebooks/bbo.ipynb](./notebooks/bbo.ipynb)).
 
 ## License
 
