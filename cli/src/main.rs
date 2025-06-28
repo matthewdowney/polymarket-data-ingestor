@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, DurationRound, Utc};
 use clap::{CommandFactory, Parser, Subcommand};
 use cli::file_reader::HistoricalDataReader;
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 /// Directory where raw feed logs are cached
 const DATA_DIR: &str = "./data/gcs_cache";
@@ -56,7 +56,7 @@ struct ReplayArgs {
 
     /// Path to the output CSV file (defaults to stdout)
     #[arg(long, short)]
-    output: Option<PathBuf>,
+    output: Option<String>,
 }
 
 #[tokio::main]
@@ -101,7 +101,13 @@ async fn run_replay(args: &ReplayArgs) -> Result<()> {
 
     // Read the files in order, keep track of market state, and write ticks to the output file
     let mut state = cli::tick_generator::MarketState::default();
-    let mut writer = csv::Writer::from_writer(std::io::stdout());
+
+    let out: Box<dyn Write> = if let Some(output) = args.output.clone() {
+        Box::new(std::fs::File::create(output)?)
+    } else {
+        Box::new(std::io::stdout())
+    };
+    let mut writer = csv::Writer::from_writer(out);
 
     // Discover files in cache directory
     let files = reader.discover_files_with_gcs_cache()?;
