@@ -73,6 +73,17 @@ Use the CLI to find market and asset ids:
 
 Load ticks in a notebook (see [./notebooks/bbo.ipynb](./notebooks/bbo.ipynb)).
 
+## Limitations
+
+1. Download and replay is slow (~2 mins to replay 24h data on laptop). Fine for one-off event studies but not so great for time ranges > 1 week
+2. Collector discovers new markets by restarting the process at intervals instead of monitoring and updating open connections
+3. Deployment to GCP VM is a bit hacky, no alerting on container issues (only systemd restarts)
+4. Would be nice to have a Grafana dashboard with the trailing ~90d of BBO and trade data
+
+Plan to speed up research workflow: log both raw .jsonl.zst messages and processed tick data as Parquet files, store both in GCS, then use Dask, DuckDB, or similar for analysis.
+
+To get a read-time dashboard: make VM bigger, use docker-compose to run ClickHouse and Grafana on the same instance, tick data writer also inserts to ClickHouse.
+
 ## License
 
 MIT
