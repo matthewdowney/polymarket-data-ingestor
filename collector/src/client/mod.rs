@@ -207,6 +207,38 @@ impl PolymarketClient {
         connections
     }
 
+    /// Fetches all markets from the Polymarket API *with rewards enabled*.
+    pub async fn fetch_sampling_markets(&self) -> Result<Vec<PolymarketMarket>> {
+        let mut cursor = None;
+        let mut markets = Vec::new();
+
+        let mut error_count = 0;
+        loop {
+            match self
+                .get_page(
+                    "https://clob.polymarket.com/sampling-markets",
+                    cursor.clone(),
+                )
+                .await
+            {
+                Ok(page) => {
+                    markets.extend(page.data);
+                    cursor = page.next_cursor;
+                    if page.count < page.limit {
+                        // no more pages
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "error fetching sampling markets, retrying...");
+                    error_count += 1;
+                    sleep(Duration::from_secs(error_count.min(30))).await;
+                }
+            }
+        }
+        Ok(markets)
+    }
+
     /// Fetches all active markets from the Polymarket API.
     ///
     /// Returns only markets that are currently accepting orders.
@@ -247,11 +279,14 @@ impl PolymarketClient {
             let handles = ids
                 .drain(0..MAX_CONCURRENCY.min(ids.len()))
                 .map(|id| {
-                    self.get_page(if id == 0 {
-                        None
-                    } else {
-                        Some(encode_number_to_base64(id * 500))
-                    })
+                    self.get_page(
+                        "https://clob.polymarket.com/markets",
+                        if id == 0 {
+                            None
+                        } else {
+                            Some(encode_number_to_base64(id * 500))
+                        },
+                    )
                     .map_err(move |e| (id, e))
                     .map_ok(move |result| (id, result))
                 })
@@ -292,8 +327,8 @@ impl PolymarketClient {
     }
 
     /// Fetches a single page of markets from the API.
-    async fn get_page(&self, cursor: Option<String>) -> Result<MarketsApiResponse> {
-        let mut url = "https://clob.polymarket.com/markets".to_string();
+    async fn get_page(&self, url: &str, cursor: Option<String>) -> Result<MarketsApiResponse> {
+        let mut url = url.to_string();
         if let Some(c) = &cursor {
             url.push_str(&format!("?next_cursor={}", c));
         }

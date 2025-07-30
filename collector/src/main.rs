@@ -329,7 +329,14 @@ async fn main() -> Result<()> {
     let cancel = CancellationToken::new();
     let client = client::PolymarketClient::new(cancel.clone());
 
-    // Fetch active markets first
+    // Fetch markets
+
+    // let markets = client.fetch_sampling_markets().await?;
+    // tracing::info!(
+    //     market_count = markets.len(),
+    //     "found sampling markets, connecting..."
+    // );
+
     let markets = client.fetch_active_markets().await?;
     tracing::info!(
         market_count = markets.len(),
