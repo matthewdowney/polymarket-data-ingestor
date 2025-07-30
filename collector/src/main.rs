@@ -301,11 +301,28 @@ impl FeedHandler {
 async fn main() -> Result<()> {
     // Set up logging
     tracing_subscriber::fmt()
-        .with_env_filter("polymarket_data_ingestor=debug,feed=debug")
+        .with_env_filter(
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "collector=debug,data_collector=debug".to_string()),
+        )
         .init();
+
+    // Log startup info via tracing
+    tracing::info!("Polymarket Data Collector starting up...");
+    tracing::info!("Working directory: {:?}", std::env::current_dir()?);
+    tracing::info!(
+        "RUST_LOG: {:?}",
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "not set".to_string())
+    );
 
     // Set up feed handler with the correct data directory
     let base_path = PathBuf::from("./data");
+    tracing::info!(
+        "Data directory: {:?}",
+        base_path
+            .canonicalize()
+            .unwrap_or_else(|_| base_path.clone())
+    );
     let mut handler = FeedHandler::new(base_path)?;
 
     // Create client to fetch markets from API

@@ -70,7 +70,7 @@ WorkingDirectory={APP_DIR}
 ExecStart={APP_DIR}/{BINARY_NAME}
 Restart=always
 RestartSec=10
-Environment=RUST_LOG=info
+Environment=RUST_LOG=info,collector=debug,data_collector=debug
 # Give the service 30 seconds to shut down gracefully
 TimeoutStopSec=30
 
@@ -254,7 +254,7 @@ fn deploy_code() -> Result<()> {
     run_cmd(Command::new("gcloud")
         .args([
             "compute", "scp", "--recurse",
-            "src/", "Cargo.toml", "Cargo.lock",
+            "cli/", "collector/", "deploy/", "tests/", "Cargo.toml", "Cargo.lock",
             &format!("{}:/tmp/{}-source", INSTANCE_NAME, SERVICE_NAME),
             "--zone", ZONE
         ]), "Failed to sync source code")?;
