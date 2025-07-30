@@ -127,6 +127,7 @@ impl Reconnecter {
     ) -> Result<ConnectionId, (ConnectionId, anyhow::Error)> {
         let is_reconnect = connection.has_ever_opened;
         if let Err(e) = connection.connect().await {
+            tracing::error!("error connecting to connection {:?}: {}", connection.id, e);
             event_tx
                 .send(ConnectionEvent::ConnectionClosed(connection.id.clone()))
                 .await

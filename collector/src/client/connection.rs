@@ -76,8 +76,14 @@ impl Connection {
         }
 
         // Open the ws and subscribe to books
-        let mut ws = self.open_socket().await?;
-        self.subscribe(&mut ws).await?;
+        let mut ws = timeout(INITIAL_READ_TIMEOUT, self.open_socket())
+            .await
+            .context("timeout opening WebSocket")?
+            .context("failed to open WebSocket")?;
+        timeout(INITIAL_READ_TIMEOUT, self.subscribe(&mut ws))
+            .await
+            .context("timeout subscribing to markets")?
+            .context("failed to subscribe to markets")?;
 
         // Only consider the connection fully open once we see a message,
         // then spawn a task to handle the rest of the messages

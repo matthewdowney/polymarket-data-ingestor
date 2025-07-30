@@ -166,9 +166,7 @@ impl PolymarketClient {
                             n_open -= 1;
                         }
 
-                        tracing::debug!(connection_id = ?id, was_open = was_open, n_open = n_open, "processing connection close event");
-
-                        // Send reconnection request (unbounded channel never blocks)
+                        // Send reconnection request
                         if let Err(e) = rtx.send(id.clone()) {
                             tracing::error!(connection_id = ?id, error = %e, "failed to send reconnection request - reconnecter channel closed");
                             (
