@@ -118,8 +118,8 @@ impl PolymarketClient {
             "requesting socket connections"
         );
         for id in connection_ids {
-            if let Err(e) = reconnecter_tx.send(id.clone()).await {
-                tracing::error!(error = %e, "error sending reconnection request");
+            if let Err(e) = reconnecter_tx.send(id.clone()) {
+                tracing::error!(error = %e, "error sending initial connection request");
                 break;
             }
         }
@@ -137,7 +137,7 @@ impl PolymarketClient {
     /// and requesting reconnects when a connection closes.
     async fn handle_events(
         &mut self,
-        rtx: mpsc::Sender<ConnectionId>,
+        rtx: mpsc::UnboundedSender<ConnectionId>,
         client_tx: mpsc::Sender<FeedEvent>,
         n_connections: usize,
     ) {
@@ -161,16 +161,22 @@ impl PolymarketClient {
                     ConnectionEvent::ConnectionClosed(id) => {
                         // Only decrement the open count if the connection was actually open,
                         // not if it failed during the initial connection attempt.
-                        if id_is_open.remove(&id).is_some() {
+                        let was_open = id_is_open.remove(&id).is_some();
+                        if was_open {
                             n_open -= 1;
                         }
-                        if let Err(e) = rtx.send(id.clone()).await {
-                            tracing::error!(error = %e, "error sending reconnection request");
+
+                        tracing::debug!(connection_id = ?id, was_open = was_open, n_open = n_open, "processing connection close event");
+
+                        // Send reconnection request (unbounded channel never blocks)
+                        if let Err(e) = rtx.send(id.clone()) {
+                            tracing::error!(connection_id = ?id, error = %e, "failed to send reconnection request - reconnecter channel closed");
                             (
                                 false,
                                 FeedEvent::ConnectionClosed(id, n_open, n_connections),
                             )
                         } else {
+                            tracing::debug!(connection_id = ?id, "successfully sent reconnection request");
                             (true, FeedEvent::ConnectionClosed(id, n_open, n_connections))
                         }
                     }

@@ -318,6 +318,7 @@ fn destroy_instance() -> Result<()> {
 fn check_status() -> Result<()> {
     println!("Checking instance status...");
     
+    println!("gcloud compute instances describe {} --zone {} --format value(status)", INSTANCE_NAME, ZONE);
     let status = Command::new("gcloud")
         .args([
             "compute", "instances", "describe", INSTANCE_NAME,

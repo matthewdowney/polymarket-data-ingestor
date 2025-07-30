@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 /// connections into a single channel.
 pub struct Reconnecter {
     /// Channel to send connection requests to.
-    pub tx: mpsc::Sender<ConnectionId>,
-    rx: mpsc::Receiver<ConnectionId>,
+    pub tx: mpsc::UnboundedSender<ConnectionId>,
+    rx: mpsc::UnboundedReceiver<ConnectionId>,
     connections: HashMap<ConnectionId, Arc<Mutex<Connection>>>,
     /// Aggregate events from all connections into a single channel.
     event_tx: mpsc::Sender<ConnectionEvent>,
@@ -32,7 +32,7 @@ impl Reconnecter {
         event_tx: mpsc::Sender<ConnectionEvent>,
         cancel: CancellationToken,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<ConnectionId>(1000);
+        let (tx, rx) = mpsc::unbounded_channel::<ConnectionId>();
         let connections = connections
             .into_iter()
             .map(|(k, v)| (k, Arc::new(Mutex::new(v))))
@@ -55,6 +55,10 @@ impl Reconnecter {
     /// Monitor connection requests, opening connections in batches and forwarding
     /// messages to [`Self::event_tx`]. Runs until the cancel token is cancelled.
     pub async fn run(&mut self) {
+        tracing::info!(
+            "reconnecter starting with {} connections",
+            self.connections.len()
+        );
         let mut error_count: u64 = 0;
         loop {
             // Either await backoff or cancellation
@@ -64,8 +68,10 @@ impl Reconnecter {
             }
 
             // Take N connection ids at once to open (returns None if the cancel token is cancelled)
+            tracing::trace!("reconnecter waiting for connection requests...");
             if let Some(ids) = self.recv_n(MAX_PARALLELISM).await {
                 let n = ids.len();
+                tracing::debug!("reconnecter received {} connection requests", n);
                 let n_errors = self.open_all(ids).await;
                 error_count = match n_errors {
                     0 => 0, // reset if no errors, increment only if majority failed
