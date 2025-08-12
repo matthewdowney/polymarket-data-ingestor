@@ -8,7 +8,7 @@ use tempfile::NamedTempFile;
 
 // Configuration constants
 const ZONE: &str = "northamerica-northeast1-a";
-const MACHINE_TYPE: &str = "e2-small";
+const MACHINE_TYPE: &str = "e2-medium";
 const BUCKET_NAME: &str = "polymarket-data-bucket";
 
 /// Project and zone-unique google compute engine instance name
@@ -57,6 +57,26 @@ chown {USER_NAME}:{USER_NAME} {APP_DIR}
 mkdir -p {DATA_DIR}
 chown -R {USER_NAME}:{USER_NAME} {DATA_DIR}
 
+# Raise file descriptor limits (system-wide, per-user, and for the service)
+# System-wide kernel limits via sysctl.d
+cat > /etc/sysctl.d/99-{SERVICE_NAME}.conf << SYSCTL_EOF
+fs.file-max = 1000000
+fs.nr_open = 1048576
+SYSCTL_EOF
+sysctl --system || true
+
+# Ensure pam_limits is active
+grep -q pam_limits.so /etc/pam.d/common-session || echo 'session required pam_limits.so' >> /etc/pam.d/common-session
+grep -q pam_limits.so /etc/pam.d/common-session-noninteractive || echo 'session required pam_limits.so' >> /etc/pam.d/common-session-noninteractive
+
+# Per-user limits for the service account
+cat > /etc/security/limits.d/{USER_NAME}.conf << LIMITS_EOF
+{USER_NAME} soft nofile 1048576
+{USER_NAME} hard nofile 1048576
+root       soft nofile 1048576
+root       hard nofile 1048576
+LIMITS_EOF
+
 # Create systemd service
 cat > /etc/systemd/system/{SERVICE_NAME}.service << EOF
 [Unit]
@@ -75,7 +95,8 @@ Environment=RUST_LOG=info,collector=debug,data_collector=debug
 TimeoutStopSec=30
 
 MemoryAccounting=true
-MemoryMax=1024M
+MemoryMax=2048M
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
