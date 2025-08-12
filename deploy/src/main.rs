@@ -108,9 +108,6 @@ cat >> /tmp/{USER_NAME}_cron << 'CRON_EOF'
 # Upload completed log files to GCS every 10 minutes
 */10 * * * * cd {APP_DIR} && gsutil -m mv {DATA_DIR}/*.jsonl.zst gs://{BUCKET_NAME}/raw/ 2>/dev/null || true
 
-# Send metrics to Cloud Logging every 2 minutes  
-*/2 * * * * journalctl -u {SERVICE_NAME} --since '2 minutes ago' | while IFS= read -r line; do gcloud logging write {SERVICE_NAME}-{BINARY_NAME} "$line" --payload-type=text; done 2>/dev/null || true
-
 # Restart the service every 6 hours to discover new markets
 0 */6 * * * sudo systemctl restart {SERVICE_NAME}
 CRON_EOF
