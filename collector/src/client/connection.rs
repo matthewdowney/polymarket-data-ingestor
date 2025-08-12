@@ -182,38 +182,49 @@ impl Connection {
 
         tokio::spawn(async move {
             let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+            // Skip the initial long delay so the first tick fires after PING_INTERVAL
             ping_interval.tick().await;
 
             loop {
                 tokio::select! {
-                    Some(msg) = ws.next() => {
+                    // Prioritize shutdown so the connection can be closed even if there are new ws messages
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        tracing::debug!(connection_id = ?id, "connection closed by client");
+                        break;
+                    }
+
+                    msg = ws.next() => {
                         match msg {
-                            Ok(Message::Text(text)) => {
+                            Some(Ok(Message::Text(text))) => {
                                 if let Err(e) = tx.send(ConnectionEvent::FeedMessage(text.to_string())).await {
                                     tracing::error!(connection_id = ?id, error = %e, "failed to send message");
                                     break;
                                 }
                             }
-                            Ok(Message::Close(_)) => {
+                            Some(Ok(Message::Close(_))) => {
                                 tracing::warn!(connection_id = ?id, "connection closed by server");
                                 break;
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 tracing::warn!(connection_id = ?id, error = %e, "WebSocket error");
                                 break;
                             }
-                            _ => {} // Ignore other message types
+                            Some(_) => {
+                                // Ignore other message types
+                            }
+                            None => {
+                                tracing::warn!(connection_id = ?id, "WebSocket stream ended");
+                                break;
+                            }
                         }
                     }
+
                     _ = ping_interval.tick() => {
                         if let Err(e) = ws.send(Message::Text(r#"{"type":"ping"}"#.into())).await {
                             tracing::error!(connection_id = ?id, error = %e, "failed to send ping");
                             break;
                         }
-                    }
-                    _ = shutdown.cancelled() => {
-                        tracing::debug!(connection_id = ?id, "connection closed by client");
-                        break;
                     }
                 }
             }
