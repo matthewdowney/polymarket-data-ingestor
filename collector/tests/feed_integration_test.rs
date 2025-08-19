@@ -1,6 +1,6 @@
 use anyhow::Result;
-use futures::StreamExt;
 use data_collector::client;
+use futures::StreamExt;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;

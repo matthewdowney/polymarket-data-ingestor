@@ -1,12 +1,18 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::File,
-    io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::Result;
-use rust_decimal::Decimal;
+use arrow::array::*;
+use arrow::datatypes::*;
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
+use rust_decimal::{prelude::*, Decimal};
 use serde::{Deserialize, Serialize};
 
 pub fn main() -> Result<()> {
@@ -17,14 +23,124 @@ pub fn main() -> Result<()> {
     let to_path = from_path.with_extension("csv");
 
     let mut state = MarketState::default();
-    let mut writer = csv::Writer::from_writer(File::create(to_path)?);
-    write_ticks(&from_path, &mut state, &mut writer)?;
+    let mut parquet_writer = ParquetTickWriter::new(to_path)?;
+    write_ticks(&from_path, &mut state, &mut parquet_writer)?;
+    parquet_writer.finish()?;
 
     Ok(())
 }
 
-pub fn read_market_info(from_path: &PathBuf) -> Result<serde_json::Value> {
-    let mut reader = BufReader::new(zstd::Decoder::new(File::open(from_path.clone())?)?);
+pub struct ParquetTickWriter {
+    writer: ArrowWriter<File>,
+    schema: Arc<Schema>,
+    batch_size: usize,
+    timestamps: Vec<String>,
+    kinds: Vec<String>,
+    markets: Vec<String>,
+    assets: Vec<String>,
+    sides: Vec<String>,
+    prices: Vec<f64>,
+    sizes: Vec<f64>,
+}
+
+impl ParquetTickWriter {
+    pub fn new(path: PathBuf) -> Result<Self> {
+        let file = File::create(path)?;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("market", DataType::Utf8, false),
+            Field::new("asset", DataType::Utf8, false),
+            Field::new("side", DataType::Utf8, false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("size", DataType::Float64, false),
+        ]));
+
+        let props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::SNAPPY)
+            .build();
+
+        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+        Ok(Self {
+            writer,
+            schema,
+            batch_size: 10000,
+            timestamps: Vec::new(),
+            kinds: Vec::new(),
+            markets: Vec::new(),
+            assets: Vec::new(),
+            sides: Vec::new(),
+            prices: Vec::new(),
+            sizes: Vec::new(),
+        })
+    }
+
+    fn write_tick(&mut self, row: Row) -> Result<()> {
+        self.timestamps.push(row.timestamp);
+        self.kinds.push(row.kind.to_string());
+        self.markets.push(row.market);
+        self.assets.push(row.asset);
+        self.sides.push(match row.side {
+            Side::Bid => "BID".to_string(),
+            Side::Ask => "ASK".to_string(),
+        });
+        self.prices.push(row.price.to_f64().unwrap());
+        self.sizes.push(row.size.to_f64().unwrap());
+
+        if self.timestamps.len() >= self.batch_size {
+            self.flush_batch()?;
+        }
+
+        Ok(())
+    }
+
+    fn flush_batch(&mut self) -> Result<()> {
+        if self.timestamps.is_empty() {
+            return Ok(());
+        }
+
+        let timestamp_arr = Arc::new(StringArray::from(
+            self.timestamps.drain(..).collect::<Vec<_>>(),
+        ));
+        let kind_arr = Arc::new(StringArray::from(self.kinds.drain(..).collect::<Vec<_>>()));
+        let market_arr = Arc::new(StringArray::from(
+            self.markets.drain(..).collect::<Vec<_>>(),
+        ));
+        let asset_arr = Arc::new(StringArray::from(self.assets.drain(..).collect::<Vec<_>>()));
+        let side_arr = Arc::new(StringArray::from(self.sides.drain(..).collect::<Vec<_>>()));
+        let price_arr = Arc::new(Float64Array::from(
+            self.prices.drain(..).collect::<Vec<_>>(),
+        ));
+        let size_arr = Arc::new(Float64Array::from(self.sizes.drain(..).collect::<Vec<_>>()));
+
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                timestamp_arr,
+                kind_arr,
+                market_arr,
+                asset_arr,
+                side_arr,
+                price_arr,
+                size_arr,
+            ],
+        )?;
+
+        self.writer.write(&batch)?;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        self.flush_batch()?;
+        self.writer.close()?;
+        Ok(())
+    }
+}
+
+pub fn read_market_info(from_path: &Path) -> Result<serde_json::Value> {
+    let mut reader = BufReader::new(zstd::Decoder::new(File::open(from_path)?)?);
 
     let mut line = String::new();
     loop {
@@ -45,12 +161,12 @@ pub fn read_market_info(from_path: &PathBuf) -> Result<serde_json::Value> {
 }
 
 /// Decompress and read the file, keeping track of market state, and write data points as CSV
-pub fn write_ticks<W: Write>(
-    from_path: &PathBuf,
+pub fn write_ticks(
+    from_path: &Path,
     state: &mut MarketState,
-    writer: &mut csv::Writer<W>,
+    writer: &mut ParquetTickWriter,
 ) -> Result<()> {
-    let mut reader = BufReader::new(zstd::Decoder::new(File::open(from_path.clone())?)?);
+    let mut reader = BufReader::new(zstd::Decoder::new(File::open(from_path)?)?);
 
     let mut line = String::new();
     loop {
@@ -164,9 +280,9 @@ impl Book {
         .unwrap_or_default()
     }
 
-    fn write_bbo<W: Write>(
+    fn write_bbo(
         &self,
-        w: &mut csv::Writer<W>,
+        w: &mut ParquetTickWriter,
         timestamp: String,
         market: String,
         asset: String,
@@ -181,7 +297,7 @@ impl Book {
             side: Side::Ask,
             kind: "BBO",
         };
-        w.serialize(row)?;
+        w.write_tick(row)?;
 
         let (px, sz) = self.top(Side::Bid);
         let row = Row {
@@ -193,7 +309,7 @@ impl Book {
             side: Side::Bid,
             kind: "BBO",
         };
-        w.serialize(row)?;
+        w.write_tick(row)?;
 
         Ok(())
     }
@@ -201,7 +317,7 @@ impl Book {
 
 impl MarketState {
     /// Update the market state, write zero or more tick data rows with the writer
-    fn update<W: Write>(&mut self, m: FeedMessage, w: &mut csv::Writer<W>) -> Result<()> {
+    fn update(&mut self, m: FeedMessage, w: &mut ParquetTickWriter) -> Result<()> {
         match m {
             FeedMessage::LastTradePrice(x) => {
                 // Skip if market id is not in the filter
@@ -210,7 +326,7 @@ impl MarketState {
                         return Ok(());
                     }
                 }
-                w.serialize(Row::from_trade(x))?;
+                w.write_tick(Row::from_trade(x))?;
             }
             FeedMessage::BookSnapshot(x) => {
                 // Skip if market id is not in the filter

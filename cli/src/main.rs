@@ -3,10 +3,7 @@ use chrono::{DateTime, DurationRound, Utc};
 use clap::{CommandFactory, Parser, Subcommand};
 use cli::file_reader::HistoricalDataReader;
 use data_collector::PolymarketMarket;
-use std::{
-    io::{IsTerminal, Write},
-    path::PathBuf,
-};
+use std::{io::IsTerminal, path::PathBuf};
 
 /// Directory where raw feed logs are cached
 const DATA_DIR: &str = "./data/gcs_cache";
@@ -148,18 +145,25 @@ async fn run_replay(args: &ReplayArgs) -> Result<()> {
         state.with_market_filter(markets);
     }
 
-    let out: Box<dyn Write> = if let Some(output) = args.output.clone() {
-        Box::new(std::fs::File::create(output)?)
+    let output_path = if let Some(output) = args.output.clone() {
+        let mut path = PathBuf::from(output);
+        if path.extension().is_none() {
+            path.set_extension("parquet");
+        }
+        path
     } else {
-        Box::new(std::io::stdout())
+        PathBuf::from("output.parquet")
     };
-    let mut writer = csv::Writer::from_writer(out);
+
+    let mut parquet_writer = cli::tick_generator::ParquetTickWriter::new(output_path)?;
 
     // Discover files in cache directory
     let files = reader.discover_files_with_gcs_cache()?;
     for file in files {
-        cli::tick_generator::write_ticks(&file, &mut state, &mut writer)?;
+        cli::tick_generator::write_ticks(&file, &mut state, &mut parquet_writer)?;
     }
+
+    parquet_writer.finish()?;
 
     Ok(())
 }
@@ -175,7 +179,7 @@ async fn run_markets(args: &MarketsArgs) -> Result<()> {
     // Use first file in range if provided, otherwise use most recent file
     let files = reader.discover_files_with_gcs_cache()?;
     let file = if args.since.is_none() && args.start.is_none() {
-        files.into_iter().rev().next()
+        files.into_iter().next_back()
     } else {
         files.into_iter().next()
     };
