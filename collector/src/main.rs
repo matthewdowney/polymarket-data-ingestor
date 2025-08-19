@@ -197,7 +197,7 @@ impl FeedHandler {
             writer.write_all(b"\n")?;
 
             // Periodic flush for reliability
-            if self.msg_count % 100 == 0 {
+            if self.msg_count.is_multiple_of(100) {
                 writer.flush()?;
             }
 
