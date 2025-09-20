@@ -143,6 +143,7 @@ impl PolymarketClient {
     ) {
         let mut n_open = 0;
         let mut id_is_open = HashMap::new();
+
         loop {
             // Get the next event or stop early if the cancel token is cancelled
             let event = tokio::select! {
@@ -156,7 +157,11 @@ impl PolymarketClient {
                     ConnectionEvent::ConnectionOpened(id) => {
                         n_open += 1;
                         id_is_open.insert(id.clone(), true);
-                        (true, FeedEvent::ConnectionOpened(id, n_open, n_connections))
+                        // Use best-effort calculation that accounts for connection splitting
+                        // When splits occur, total connections can exceed initial count
+                        let pending_connections = n_connections.saturating_sub(n_open);
+                        let current_total = id_is_open.len() + pending_connections;
+                        (true, FeedEvent::ConnectionOpened(id, n_open, current_total))
                     }
                     ConnectionEvent::ConnectionClosed(id) => {
                         // Only decrement the open count if the connection was actually open,
@@ -166,16 +171,21 @@ impl PolymarketClient {
                             n_open -= 1;
                         }
 
+                        // Use best-effort calculation that accounts for connection splitting
+                        // When splits occur, total connections can exceed initial count
+                        let pending_connections = n_connections.saturating_sub(n_open);
+                        let current_total = id_is_open.len() + pending_connections;
+
                         // Send reconnection request
                         if let Err(e) = rtx.send(id.clone()) {
                             tracing::error!(connection_id = ?id, error = %e, "failed to send reconnection request - reconnecter channel closed");
                             (
                                 false,
-                                FeedEvent::ConnectionClosed(id, n_open, n_connections),
+                                FeedEvent::ConnectionClosed(id, n_open, current_total),
                             )
                         } else {
                             tracing::debug!(connection_id = ?id, "successfully sent reconnection request");
-                            (true, FeedEvent::ConnectionClosed(id, n_open, n_connections))
+                            (true, FeedEvent::ConnectionClosed(id, n_open, current_total))
                         }
                     }
                 };
@@ -378,8 +388,119 @@ fn take_chunk(markets: &mut VecDeque<PolymarketMarket>) -> Vec<PolymarketMarket>
     chunk
 }
 
+/// Split a list of markets into two roughly equal groups.
+/// Returns (first_half, second_half) where both groups are as equal as possible.
+///
+/// # Examples
+///
+/// ```
+/// // 4 markets -> (2, 2)
+/// // 5 markets -> (2, 3)
+/// // 1 market -> (0, 1)
+/// // 0 markets -> (0, 0)
+/// ```
+pub(crate) fn split_markets(
+    markets: Vec<PolymarketMarket>,
+) -> (Vec<PolymarketMarket>, Vec<PolymarketMarket>) {
+    let mid = markets.len() / 2;
+    let (first_half, second_half) = markets.split_at(mid);
+    (first_half.to_vec(), second_half.to_vec())
+}
+
 impl Drop for PolymarketClient {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_market(id: u64) -> PolymarketMarket {
+        use crate::{MarketToken, PolymarketMarket};
+        use std::collections::HashMap;
+
+        PolymarketMarket {
+            closed: false,
+            accepting_orders: true,
+            active: true,
+            archived: false,
+            enable_order_book: true,
+            id: Some(id.to_string()),
+            condition_id: format!("condition_{}", id),
+            question_id: format!("question_{}", id),
+            question: format!("Test question {}", id),
+            description: format!("Test description {}", id),
+            tokens: vec![
+                MarketToken {
+                    outcome: "Yes".to_string(),
+                    price: 0.5,
+                    token_id: format!("token_yes_{}", id),
+                    winner: false,
+                    other: HashMap::new(),
+                },
+                MarketToken {
+                    outcome: "No".to_string(),
+                    price: 0.5,
+                    token_id: format!("token_no_{}", id),
+                    winner: false,
+                    other: HashMap::new(),
+                },
+            ],
+            other: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_split_markets_empty() {
+        let markets = vec![];
+        let (first, second) = split_markets(markets);
+        assert_eq!(first.len(), 0);
+        assert_eq!(second.len(), 0);
+    }
+
+    #[test]
+    fn test_split_markets_single() {
+        let markets = vec![create_test_market(1)];
+        let (first, second) = split_markets(markets);
+        assert_eq!(first.len(), 0);
+        assert_eq!(second.len(), 1);
+    }
+
+    #[test]
+    fn test_split_markets_even_count() {
+        let markets = vec![
+            create_test_market(1),
+            create_test_market(2),
+            create_test_market(3),
+            create_test_market(4),
+        ];
+        let (first, second) = split_markets(markets);
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+    }
+
+    #[test]
+    fn test_split_markets_odd_count() {
+        let markets = vec![
+            create_test_market(1),
+            create_test_market(2),
+            create_test_market(3),
+            create_test_market(4),
+            create_test_market(5),
+        ];
+        let (first, second) = split_markets(markets);
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 3);
+    }
+
+    #[test]
+    fn test_split_markets_large_count() {
+        let markets: Vec<_> = (0..25).map(create_test_market).collect();
+        let (first, second) = split_markets(markets);
+        assert_eq!(first.len(), 12);
+        assert_eq!(second.len(), 13);
+        assert_eq!(first.len() + second.len(), 25);
     }
 }

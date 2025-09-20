@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use polymarket_data_ingestor::client::PolymarketClient;
+//! use data_collector::client::PolymarketClient;
 //! use tokio_util::sync::CancellationToken;
 //!
 //! #[tokio::main]
@@ -27,7 +27,6 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 pub mod client;
-
 
 /// A token represents one outcome in a prediction market.
 #[derive(Debug, Clone, Deserialize, Serialize)]

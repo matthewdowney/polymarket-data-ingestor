@@ -1,5 +1,5 @@
 use crate::client::connection::{Connection, ConnectionEvent, ConnectionId};
-use crate::client::MAX_PARALLELISM;
+use crate::client::{split_markets, MAX_PARALLELISM};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,6 +22,8 @@ pub struct Reconnecter {
     cancel: CancellationToken,
     /// Counter of connections that have *ever* been opened successfully.
     n_opened: Arc<AtomicUsize>,
+    /// Counter for generating new connection IDs when splitting.
+    next_connection_id: Arc<AtomicUsize>,
 }
 
 impl Reconnecter {
@@ -33,6 +35,14 @@ impl Reconnecter {
         cancel: CancellationToken,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<ConnectionId>();
+
+        // Find the highest connection ID to start the counter from
+        let max_id = connections
+            .keys()
+            .map(|ConnectionId(id)| *id)
+            .max()
+            .unwrap_or(0);
+
         let connections = connections
             .into_iter()
             .map(|(k, v)| (k, Arc::new(Mutex::new(v))))
@@ -44,6 +54,7 @@ impl Reconnecter {
             event_tx,
             cancel,
             n_opened: Arc::new(AtomicUsize::new(0)),
+            next_connection_id: Arc::new(AtomicUsize::new(max_id as usize + 1)),
         }
     }
 
@@ -56,8 +67,8 @@ impl Reconnecter {
     /// messages to [`Self::event_tx`]. Runs until the cancel token is cancelled.
     pub async fn run(&mut self) {
         tracing::info!(
-            "reconnecter starting with {} connections",
-            self.connections.len()
+            initial_connection_count = self.connections.len(),
+            "reconnecter_started"
         );
         let mut error_count: u64 = 0;
         loop {
@@ -80,10 +91,12 @@ impl Reconnecter {
                 };
 
                 tracing::debug!(
-                    "{}/{} new connections succeeded, backing off {:?}",
-                    n - n_errors,
-                    n,
-                    self.backoff_duration(error_count)
+                    successful_connections = n - n_errors,
+                    total_attempts = n,
+                    error_count = error_count,
+                    backoff_duration_ms = self.backoff_duration(error_count).as_millis(),
+                    current_connection_count = self.connections.len(),
+                    "connection_batch_completed"
                 );
             } else {
                 break; // tx is closed
@@ -183,10 +196,47 @@ impl Reconnecter {
     }
 
     /// Open all the connections in parallel and count the number of errors.
+    /// Checks for split conditions before attempting connection.
     async fn open_all(&mut self, ids: Vec<ConnectionId>) -> usize {
-        // Fire off all the connection attempts in parallel
-        let mut handles = Vec::with_capacity(ids.len());
+        // Check for split conditions and perform splits
+        let mut final_ids = Vec::new();
         for id in ids {
+            // Check if this connection should be split
+            if let Some(conn) = self.connections.get(&id) {
+                let should_split = {
+                    let mut connection = conn.lock().await;
+                    connection.process_connection_closed(); // Process connection closure first
+                    connection.should_split()
+                };
+
+                if should_split {
+                    tracing::info!(
+                        connection_id = ?id,
+                        "connection_split_initiated"
+                    );
+
+                    if let Some((first_id, second_id)) = self.split_connection(id.clone()) {
+                        final_ids.push(first_id);
+                        final_ids.push(second_id);
+                    } else {
+                        tracing::warn!(
+                            connection_id = ?id,
+                            "connection_split_failed"
+                        );
+                        final_ids.push(id);
+                    }
+                } else {
+                    final_ids.push(id);
+                }
+            } else {
+                tracing::error!(connection_id = ?id, "connection not found");
+                final_ids.push(id); // Keep it to avoid losing the ID
+            }
+        }
+
+        // Fire off all the connection attempts in parallel
+        let mut handles = Vec::with_capacity(final_ids.len());
+        for id in final_ids {
             if let Some(conn) = self.connections.get(&id) {
                 let conn = Arc::clone(conn);
                 let event_tx = self.event_tx.clone();
@@ -221,5 +271,81 @@ impl Reconnecter {
         }
 
         n_errors
+    }
+
+    /// Split a connection into two new connections with roughly equal market distribution.
+    ///
+    /// Removes the original connection and creates two new connections with split markets.
+    /// Returns the new connection IDs if successful, or None if the connection cannot be split.
+    pub fn split_connection(&mut self, id: ConnectionId) -> Option<(ConnectionId, ConnectionId)> {
+        // Remove the original connection
+        let original_connection = self.connections.remove(&id)?;
+
+        // Extract the connection to get its markets (this will block briefly)
+        let markets = {
+            let conn = original_connection.try_lock().ok()?;
+            conn.markets.clone()
+        };
+
+        // Cannot split if we have 1 or fewer markets
+        if markets.len() <= 1 {
+            // Put the connection back
+            self.connections.insert(id, original_connection);
+            return None;
+        }
+
+        // Split the markets
+        let (first_markets, second_markets) = split_markets(markets);
+
+        // Generate new connection IDs
+        let first_id = ConnectionId(self.next_connection_id.fetch_add(1, Ordering::Relaxed) as u64);
+        let second_id =
+            ConnectionId(self.next_connection_id.fetch_add(1, Ordering::Relaxed) as u64);
+
+        // Create new connections
+        let first_connection = Connection::new(
+            first_id.clone(),
+            first_markets.clone(),
+            self.event_tx.clone(),
+        );
+        let second_connection = Connection::new(
+            second_id.clone(),
+            second_markets.clone(),
+            self.event_tx.clone(),
+        );
+
+        // Add the new connections to our tracking
+        self.connections
+            .insert(first_id.clone(), Arc::new(Mutex::new(first_connection)));
+        self.connections
+            .insert(second_id.clone(), Arc::new(Mutex::new(second_connection)));
+
+        tracing::info!(
+            original_connection_id = ?id,
+            new_connection_ids = ?[&first_id, &second_id],
+            "connection_split_successful"
+        );
+
+        // Log individual market isolation if we get down to single markets
+        if first_markets.len() == 1 {
+            if let Some(market_id) = first_markets.first().and_then(|m| m.id.as_ref()) {
+                tracing::warn!(
+                    connection_id = ?first_id,
+                    market_id = market_id,
+                    "problematic_market_isolated"
+                );
+            }
+        }
+        if second_markets.len() == 1 {
+            if let Some(market_id) = second_markets.first().and_then(|m| m.id.as_ref()) {
+                tracing::warn!(
+                    connection_id = ?second_id,
+                    market_id = market_id,
+                    "problematic_market_isolated"
+                );
+            }
+        }
+
+        Some((first_id, second_id))
     }
 }
