@@ -109,7 +109,7 @@ cat >> /tmp/{USER_NAME}_cron << 'CRON_EOF'
 */10 * * * * cd {APP_DIR} && gsutil -m mv {DATA_DIR}/*.jsonl.zst gs://{BUCKET_NAME}/raw/ 2>/dev/null || true
 
 # Restart the service every 6 hours to discover new markets
-0 */6 * * * sudo systemctl restart {SERVICE_NAME}
+25 */6 * * * sudo systemctl restart {SERVICE_NAME}
 CRON_EOF
 
 crontab -u {USER_NAME} /tmp/{USER_NAME}_cron
