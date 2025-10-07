@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use std::io::Write;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
 use tempfile::NamedTempFile;
-use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(name = "deploy")]

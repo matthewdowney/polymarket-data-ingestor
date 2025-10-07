@@ -392,7 +392,7 @@ enum FeedMessage {
     Trade { msg: KalshiPublicTrade },
 
     #[serde(rename = "ticker")]
-    Ticker { sid: u64, msg: KalshiTicker },
+    Ticker { _sid: u64, _msg: KalshiTicker },
 
     #[serde(other)]
     Other,

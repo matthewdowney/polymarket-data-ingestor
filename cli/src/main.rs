@@ -3,7 +3,7 @@ use chrono::{DateTime, DurationRound, Utc};
 use clap::{CommandFactory, Parser, Subcommand};
 use cli::file_reader::HistoricalDataReader;
 use cli::Venue;
-use data_collector::PolymarketMarket;
+use data_collector::{KalshiMarket, PolymarketMarket};
 use std::{io::IsTerminal, path::PathBuf};
 
 /// Directory where raw feed logs are cached
@@ -140,14 +140,9 @@ async fn run_replay(args: &ReplayArgs, venue: Venue) -> Result<()> {
 
     let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
     let cache_dir = PathBuf::from(DATA_DIR);
-    let reader = HistoricalDataReader::new(cache_dir, start, end, venue);
+    let reader = HistoricalDataReader::new(cache_dir, start, end, venue.clone());
 
     // Read the files in order, keep track of market state, and write ticks to the output file
-    let mut state = cli::tick_generator::MarketState::default();
-    if let Some(markets) = args.markets.clone() {
-        state.with_market_filter(markets);
-    }
-
     let output_path = if let Some(output) = args.output.clone() {
         let mut path = PathBuf::from(output);
         if path.extension().is_none() {
@@ -158,15 +153,33 @@ async fn run_replay(args: &ReplayArgs, venue: Venue) -> Result<()> {
         PathBuf::from("output.parquet")
     };
 
-    let mut parquet_writer = cli::tick_generator::ParquetTickWriter::new(output_path)?;
-
-    // Discover files in cache directory
-    let files = reader.discover_files_with_gcs_cache()?;
-    for file in files {
-        cli::tick_generator::write_ticks(&file, &mut state, &mut parquet_writer)?;
+    match venue {
+        Venue::Polymarket => {
+            let mut state = cli::tick_generator::MarketState::default();
+            if let Some(markets) = args.markets.clone() {
+                state.with_market_filter(markets);
+            }
+            let mut parquet_writer = cli::tick_generator::ParquetTickWriter::new(output_path)?;
+            let files = reader.discover_files_with_gcs_cache()?;
+            for file in files {
+                cli::tick_generator::write_ticks(&file, &mut state, &mut parquet_writer)?;
+            }
+            parquet_writer.finish()?;
+        }
+        Venue::Kalshi => {
+            let mut state = cli::kalshi_tick_generator::MarketState::default();
+            if let Some(markets) = args.markets.clone() {
+                state.with_market_filter(markets);
+            }
+            let mut parquet_writer =
+                cli::kalshi_tick_generator::ParquetTickWriter::new(output_path)?;
+            let files = reader.discover_files_with_gcs_cache()?;
+            for file in files {
+                cli::kalshi_tick_generator::write_ticks(&file, &mut state, &mut parquet_writer)?;
+            }
+            parquet_writer.finish()?;
+        }
     }
-
-    parquet_writer.finish()?;
 
     Ok(())
 }
@@ -177,7 +190,7 @@ async fn run_markets(args: &MarketsArgs, venue: Venue) -> Result<()> {
 
     let (start, end) = parse_time_range(args.since.clone(), Some(start), Some(today))?;
     let cache_dir = PathBuf::from(DATA_DIR);
-    let reader = HistoricalDataReader::new(cache_dir, start, end, venue);
+    let reader = HistoricalDataReader::new(cache_dir, start, end, venue.clone());
 
     // Use first file in range if provided, otherwise use most recent file
     let files = reader.discover_files_with_gcs_cache()?;
@@ -188,11 +201,15 @@ async fn run_markets(args: &MarketsArgs, venue: Venue) -> Result<()> {
     };
 
     if let Some(file) = file {
-        let msg = cli::tick_generator::read_market_info(&file)?;
+        let msg = match venue.clone() {
+            Venue::Polymarket => cli::tick_generator::read_market_info(&file)?,
+            Venue::Kalshi => cli::kalshi_tick_generator::read_market_info(&file)?,
+        };
+
         if args.raw {
             println!("{}", serde_json::to_string(&msg)?);
         } else {
-            print_markets(msg, args)?;
+            print_markets(msg, args, venue.clone())?;
         }
     } else {
         eprintln!(
@@ -204,39 +221,59 @@ async fn run_markets(args: &MarketsArgs, venue: Venue) -> Result<()> {
     Ok(())
 }
 
-fn print_markets(mut msg: serde_json::Value, args: &MarketsArgs) -> Result<()> {
+fn print_markets(mut msg: serde_json::Value, args: &MarketsArgs, venue: Venue) -> Result<()> {
     let (gray, green, reset) = get_colors();
     let markets = msg
         .get_mut("markets")
         .ok_or(anyhow!("no markets field found"))?
         .take();
-    let markets: Vec<PolymarketMarket> = serde_json::from_value(markets)?;
-    if args.csv {
-        println!("question,question_id,outcome,token_id");
-    }
-    for market in markets {
-        if let Some(filter) = args.filter.as_ref() {
-            if !market
-                .question
-                .to_lowercase()
-                .contains(&filter.to_lowercase())
-            {
-                continue;
+
+    match venue {
+        Venue::Polymarket => {
+            let markets: Vec<PolymarketMarket> = serde_json::from_value(markets)?;
+            if args.csv {
+                println!("question,question_id,outcome,token_id");
+            }
+            for market in markets {
+                if let Some(filter) = args.filter.as_ref() {
+                    if !market
+                        .question
+                        .to_lowercase()
+                        .contains(&filter.to_lowercase())
+                    {
+                        continue;
+                    }
+                }
+                if args.csv {
+                    for token in market.tokens {
+                        println!(
+                            "{},{},{},{}",
+                            market.question, market.question_id, token.outcome, token.token_id
+                        );
+                    }
+                } else {
+                    println!("{}", market.question);
+                    println!("  {}{}{}", gray, market.condition_id, reset);
+                    for token in market.tokens {
+                        print!("  {}{:<10}{}", green, token.outcome, reset);
+                        println!("  {}{}{}", gray, token.token_id, reset);
+                    }
+                }
             }
         }
-        if args.csv {
-            for token in market.tokens {
-                println!(
-                    "{},{},{},{}",
-                    market.question, market.question_id, token.outcome, token.token_id
-                );
+        Venue::Kalshi => {
+            let markets: Vec<KalshiMarket> = serde_json::from_value(markets)?;
+            if args.csv {
+                println!("title,ticker");
             }
-        } else {
-            println!("{}", market.question);
-            println!("  {}{}{}", gray, market.condition_id, reset);
-            for token in market.tokens {
-                print!("  {}{:<10}{}", green, token.outcome, reset);
-                println!("  {}{}{}", gray, token.token_id, reset);
+            for market in markets {
+                if let Some(filter) = args.filter.as_ref() {
+                    if !market.title.to_lowercase().contains(&filter.to_lowercase()) {
+                        continue;
+                    }
+                }
+                println!("{}", market.title);
+                println!("  {}{}{}", gray, market.ticker, reset);
             }
         }
     }

@@ -3,8 +3,8 @@ mod reconnector;
 
 use std::time::Duration;
 
-/// Each Kalshi WebSocket holds up to this many tickers.
-pub const MAX_TICKERS_PER_CONNECTION: usize = 2000;
+/// Maximum number of connections allowed by Kalshi
+pub const MAX_CONNECTIONS: usize = 20;
 /// Base HTTP URL for the Kalshi API
 pub const BASE_URL: &str = "https://api.elections.kalshi.com/trade-api/v2";
 /// URL for the Kalshi WebSocket feed.
@@ -22,7 +22,7 @@ use crate::{ConnectionEvent, ConnectionId, FeedEvent, FeedEventStream};
 use crate::{KalshiCredentials, KalshiMarket, KalshiMarketsApiResponse};
 use anyhow::Result;
 use reqwest;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -61,14 +61,13 @@ impl KalshiClient {
         tx: mpsc::Sender<FeedEvent>,
     ) {
         // Distribute the markets across connections
-        let connections = self.build_connections(credentials, markets);
-        let connection_ids = connections.keys().cloned().collect::<Vec<_>>();
-        let connection_count = connection_ids.len();
+        let connection =
+            Connection::new(ConnectionId(0), credentials, markets, self.event_tx.clone());
 
         // Spawn a reconnecter task
         let cancel_reconnecter = CancellationToken::new();
         let mut reconnecter = Reconnecter::new(
-            connections,
+            HashMap::from([(ConnectionId(0), connection)]),
             self.event_tx.clone(),
             cancel_reconnecter.clone(),
         );
@@ -76,20 +75,14 @@ impl KalshiClient {
         let reconnecter_handle = tokio::spawn(async move { reconnecter.run().await });
 
         // Initial connection requests
-        tracing::info!(
-            connection_count = connection_ids.len(),
-            "requesting socket connections"
-        );
-        for id in connection_ids {
-            if let Err(e) = reconnecter_tx.send(id.clone()) {
-                tracing::error!(error = %e, "error sending initial connection request");
-                break;
-            }
+        tracing::info!(connection_count = 1, "requesting socket connections");
+        if let Err(e) = reconnecter_tx.send(ConnectionId(0)) {
+            tracing::error!(error = %e, "error sending initial connection request");
+            return;
         }
 
         // Wait for self to finish
-        self.handle_events(reconnecter_tx, tx, connection_count)
-            .await;
+        self.handle_events(reconnecter_tx, tx, 1).await;
 
         // Wait for the reconnecter to finish
         cancel_reconnecter.cancel();
@@ -102,7 +95,7 @@ impl KalshiClient {
         &mut self,
         rtx: mpsc::UnboundedSender<ConnectionId>,
         client_tx: mpsc::Sender<FeedEvent>,
-        n_connections: usize,
+        _n_connections: usize,
     ) {
         let mut n_open = 0;
         let mut id_is_open = HashMap::new();
@@ -122,7 +115,7 @@ impl KalshiClient {
                         id_is_open.insert(id.clone(), true);
                         // Use best-effort calculation that accounts for connection splitting
                         // When splits occur, total connections can exceed initial count
-                        let pending_connections = n_connections.saturating_sub(n_open);
+                        let pending_connections = MAX_CONNECTIONS.saturating_sub(n_open);
                         let current_total = id_is_open.len() + pending_connections;
                         (true, FeedEvent::ConnectionOpened(id, n_open, current_total))
                     }
@@ -136,7 +129,7 @@ impl KalshiClient {
 
                         // Use best-effort calculation that accounts for connection splitting
                         // When splits occur, total connections can exceed initial count
-                        let pending_connections = n_connections.saturating_sub(n_open);
+                        let pending_connections = MAX_CONNECTIONS.saturating_sub(n_open);
                         let current_total = id_is_open.len() + pending_connections;
 
                         // Send reconnection request
@@ -163,30 +156,6 @@ impl KalshiClient {
         }
 
         tracing::info!("client event handler shut down");
-    }
-
-    // Split the markets across different connections
-    fn build_connections(
-        &mut self,
-        credentials: KalshiCredentials,
-        m: Vec<KalshiMarket>,
-    ) -> HashMap<ConnectionId, Connection> {
-        let mut connections = HashMap::new();
-        let mut id = 0;
-        let mut markets = VecDeque::from(m);
-        while !markets.is_empty() {
-            let chunk = take_chunk(&mut markets);
-            let connection = Connection::new(
-                ConnectionId(id),
-                credentials.clone(),
-                chunk,
-                self.event_tx.clone(),
-            );
-            connections.insert(ConnectionId(id), connection);
-            id += 1;
-        }
-
-        connections
     }
 
     /// Fetches all actives markets from the Kalshi API.
@@ -300,28 +269,6 @@ impl KalshiClient {
             (page.into_vec(), next_cursor)
         })
     }
-}
-
-/// Take a chunk of markets from the front of the queue such that the total number of
-/// tickers is <= [`crate::client::MAX_TICKERS_PER_CONNECTION`] OR the chunk contains just one market,
-/// in the case of a market with too many tickers.
-fn take_chunk(markets: &mut VecDeque<KalshiMarket>) -> Vec<KalshiMarket> {
-    let mut chunk = Vec::new();
-    let mut n_assets = 0;
-    while n_assets < MAX_TICKERS_PER_CONNECTION {
-        if let Some(market) = markets.pop_front() {
-            n_assets += 1;
-
-            if n_assets > MAX_TICKERS_PER_CONNECTION && !chunk.is_empty() {
-                markets.push_front(market);
-                return chunk;
-            }
-            chunk.push(market);
-        } else {
-            break;
-        }
-    }
-    chunk
 }
 
 pub(crate) fn split_markets(markets: Vec<KalshiMarket>) -> (Vec<KalshiMarket>, Vec<KalshiMarket>) {
