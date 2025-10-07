@@ -16,17 +16,16 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// Maximum number of connections to open at once.
 pub const MAX_PARALLELISM: usize = 50;
 
-use crate::{MarketsApiResponse, PolymarketMarket};
+use crate::{
+    ConnectionEvent, ConnectionId, FeedEvent, FeedEventStream, MarketsApiResponse, PolymarketMarket,
+};
 use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
-use connection::{Connection, ConnectionEvent, ConnectionId};
-use futures::Stream;
+use connection::Connection;
 use futures_util::{future::join_all, TryFutureExt};
 use reconnecter::Reconnecter;
 use reqwest;
 use std::collections::{HashMap, VecDeque};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -39,43 +38,6 @@ pub struct PolymarketClient {
     event_rx: mpsc::Receiver<ConnectionEvent>,
     cancel: CancellationToken,
     http_client: reqwest::Client,
-}
-
-/// Events emitted by the client during operation.
-#[derive(Debug)]
-pub enum FeedEvent {
-    /// A raw JSON message received from the WebSocket feed.
-    FeedMessage(String),
-    /// A WebSocket connection was successfully opened.
-    ///
-    /// Contains: (connection_id, number_of_open_connections, total_connections)
-    ConnectionOpened(ConnectionId, usize, usize),
-    /// A WebSocket connection was closed or failed to connect.
-    ///
-    /// Contains: (connection_id, number_of_open_connections, total_connections)
-    ///
-    /// This event is emitted both when an open connection closes and when
-    /// an initial connection attempt fails.
-    ConnectionClosed(ConnectionId, usize, usize),
-}
-
-/// A stream of feed events from the Polymarket client.
-pub struct FeedEventStream {
-    rx: mpsc::Receiver<FeedEvent>,
-}
-
-impl Stream for FeedEventStream {
-    type Item = FeedEvent;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
-    }
-}
-
-impl FeedEventStream {
-    fn new(rx: mpsc::Receiver<FeedEvent>) -> Self {
-        Self { rx }
-    }
 }
 
 impl PolymarketClient {

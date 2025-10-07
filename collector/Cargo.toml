@@ -21,6 +21,12 @@ base64 = { workspace = true }
 tokio-util = { workspace = true }
 zstd = { workspace = true }
 chrono = { workspace = true }
+rand = { workspace = true }
+rsa = { workspace = true }
+rust_decimal = { workspace = true }
+sha2 = { workspace = true }
+dotenvy = { workspace = true }
+clap = { workspace = true }
 
 [[bin]]
 name = "collector"

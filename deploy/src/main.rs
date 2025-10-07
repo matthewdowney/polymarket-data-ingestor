@@ -1,35 +1,77 @@
 use anyhow::{Context, Result};
-use std::env;
 use std::io::Write;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
 use tempfile::NamedTempFile;
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(name = "deploy")]
+struct Args {
+    #[arg(value_enum)]
+    venue: Venue,
+    #[arg(value_enum)]
+    command: DeployCommand,
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum Venue {
+    Polymarket,
+    Kalshi,
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum DeployCommand {
+    Create,
+    Update,
+    Destroy,
+    Status,
+}
+
+struct DeployConfig {
+    instance_name: &'static str,
+    bucket_name: &'static str,
+    service_name: &'static str,
+    user_name: &'static str,
+    app_dir: &'static str,
+    data_dir: &'static str,
+    venue: &'static str,
+}
+
+impl DeployConfig {
+    fn for_venue(venue: &Venue) -> Self {
+        match venue {
+            Venue::Polymarket => Self {
+                instance_name: "polymarket",
+                bucket_name: "polymarket-data-bucket",
+                service_name: "pdi",
+                user_name: "polymarket",
+                app_dir: "/opt/pdi",
+                data_dir: "/opt/pdi/data",
+                venue: "polymarket",
+            },
+            Venue::Kalshi => Self {
+                instance_name: "kalshi",
+                bucket_name: "kalshi-data-bucket",
+                service_name: "kdi",
+                user_name: "kalshi",
+                app_dir: "/opt/kdi",
+                data_dir: "/opt/kdi/data",
+                venue: "kalshi",
+            },
+        }
+    }
+}
 
 // Configuration constants
 const ZONE: &str = "northamerica-northeast1-a";
 const MACHINE_TYPE: &str = "e2-medium";
-const BUCKET_NAME: &str = "polymarket-data-bucket";
-
-/// Project and zone-unique google compute engine instance name
-const INSTANCE_NAME: &str = "polymarket";
-
-/// Service name for systemd
-const SERVICE_NAME: &str = "pdi";
-
-/// Non-root user created for the service
-const USER_NAME: &str = "polymarket";
-
-/// Directory for the application binary
-const APP_DIR: &str = "/opt/pdi";
-
-/// Directory where the app puts data ready to move to the bucket
-const DATA_DIR: &str = "/opt/pdi/data";
 
 /// Name of the binary to build (match a target in Cargo.toml)
 const BINARY_NAME: &str = "collector";
 
-fn get_setup_script() -> String {
+fn get_setup_script(config: &DeployConfig) -> String {
     format!(
         r#"#!/bin/bash
 set -euo pipefail
@@ -44,11 +86,11 @@ apt-get install -y build-essential pkg-config libssl-dev curl git
 # Create application directory and user first
 useradd -m -s /bin/bash {USER_NAME} || true
 
-# Add sudo permissions for the polymarket user
+# Add sudo permissions for the user
 echo "{USER_NAME} ALL=(ALL) NOPASSWD: /bin/systemctl restart {SERVICE_NAME}" > /etc/sudoers.d/{USER_NAME}
 chmod 440 /etc/sudoers.d/{USER_NAME}
 
-# Install Rust for the polymarket user
+# Install Rust for the user
 sudo -u {USER_NAME} bash -c 'curl --proto '\''=https'\'' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
 mkdir -p {APP_DIR}
 chown {USER_NAME}:{USER_NAME} {APP_DIR}
@@ -80,14 +122,14 @@ LIMITS_EOF
 # Create systemd service
 cat > /etc/systemd/system/{SERVICE_NAME}.service << EOF
 [Unit]
-Description=Polymarket Data Ingestor
+Description={VENUE} Data Ingestor
 After=network.target
 
 [Service]
 Type=simple
 User={USER_NAME}
 WorkingDirectory={APP_DIR}
-ExecStart={APP_DIR}/{BINARY_NAME}
+ExecStart={APP_DIR}/{BINARY_NAME} {VENUE}
 Restart=always
 RestartSec=10
 Environment=RUST_LOG=info,collector=debug,data_collector=debug
@@ -102,7 +144,7 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-# Set up cron jobs for the polymarket user
+# Set up cron jobs for the user
 crontab -u {USER_NAME} -l 2>/dev/null || true > /tmp/{USER_NAME}_cron
 cat >> /tmp/{USER_NAME}_cron << 'CRON_EOF'
 # Upload completed log files to GCS every 10 minutes
@@ -121,44 +163,36 @@ systemctl enable {SERVICE_NAME}
 
 echo "Setup complete!"
 "#,
-        USER_NAME = USER_NAME,
-        APP_DIR = APP_DIR,
-        DATA_DIR = DATA_DIR,
-        SERVICE_NAME = SERVICE_NAME,
+        USER_NAME = config.user_name,
+        APP_DIR = config.app_dir,
+        DATA_DIR = config.data_dir,
+        SERVICE_NAME = config.service_name,
         BINARY_NAME = BINARY_NAME,
-        BUCKET_NAME = BUCKET_NAME
+        BUCKET_NAME = config.bucket_name,
+        VENUE = config.venue
     )
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
+    let args = Args::parse();
+    let config = DeployConfig::for_venue(&args.venue);
 
-    if args.len() < 2 {
-        eprintln!("Usage: {} <create|update|destroy|status>", args[0]);
-        std::process::exit(1);
-    }
-
-    match args[1].as_str() {
-        "create" => create_instance(),
-        "update" => deploy_code(),
-        "destroy" => destroy_instance(),
-        "status" => check_status(),
-        _ => {
-            eprintln!("Unknown command: {}", args[1]);
-            eprintln!("Available commands: create, update, destroy, status");
-            std::process::exit(1);
-        }
+    match args.command {
+        DeployCommand::Create => create_instance(&config),
+        DeployCommand::Update => deploy_code(&config),
+        DeployCommand::Destroy => destroy_instance(&config),
+        DeployCommand::Status => check_status(&config),
     }
 }
 
 #[rustfmt::skip]
-fn create_instance() -> Result<()> {
+fn create_instance(config: &DeployConfig) -> Result<()> {
     println!("Creating GCP instance and storage bucket...");
 
     // Create storage bucket
     println!("Creating storage bucket...");
     let bucket_output = Command::new("gsutil")
-        .args(["mb", &format!("gs://{}", BUCKET_NAME)])
+        .args(["mb", &format!("gs://{}", config.bucket_name)])
         .output()
         .context("Failed to create bucket")?;
     
@@ -200,14 +234,14 @@ fn create_instance() -> Result<()> {
         .args([
             "lifecycle", "set",
             temp_file.path().to_str().unwrap(),
-            &format!("gs://{}", BUCKET_NAME),
+            &format!("gs://{}", config.bucket_name),
         ]), "Failed to set bucket lifecycle")?;
 
     // Create compute instance
     println!("Creating compute instance...");
     run_cmd(Command::new("gcloud")
         .args([
-            "compute", "instances", "create", INSTANCE_NAME,
+            "compute", "instances", "create", config.instance_name,
             "--zone", ZONE,
             "--machine-type", MACHINE_TYPE,
             "--image-family", "ubuntu-2204-lts",
@@ -215,65 +249,65 @@ fn create_instance() -> Result<()> {
             "--boot-disk-size", "100GB",
             "--boot-disk-type", "pd-ssd",
             "--scopes", "storage-rw,logging-write,monitoring-write",
-            "--tags", INSTANCE_NAME,
+            "--tags", config.instance_name,
             "--metadata", "enable-oslogin=true"
         ]), "Failed to create instance")?;
 
     // Wait for instance to be ready
-    wait_for_instance_ready()?;
+    wait_for_instance_ready(config)?;
 
     // Create and copy setup script
     println!("Preparing setup script...");
     let mut temp_file = NamedTempFile::new().context("Failed to create temporary file")?;
-    temp_file.write_all(get_setup_script().as_bytes()).context("Failed to write setup script")?;
+    temp_file.write_all(get_setup_script(config).as_bytes()).context("Failed to write setup script")?;
 
     println!("Copying setup script...");
     run_cmd(Command::new("gcloud")
         .args([
             "compute", "scp",
             temp_file.path().to_str().unwrap(),
-            &format!("{}:/tmp/setup.sh", INSTANCE_NAME),
+            &format!("{}:/tmp/setup.sh", config.instance_name),
             "--zone", ZONE
         ]), "Failed to copy setup script")?;
 
-    run_cmd(&mut gcloud_ssh_cmd("sudo bash /tmp/setup.sh"), "Setup script failed")?;
+    run_cmd(&mut gcloud_ssh_cmd(config, "sudo bash /tmp/setup.sh"), "Setup script failed")?;
 
     println!("✅ Instance created and configured!");
     println!("Next steps:");
-    println!("  1. Run: cargo run --bin deploy -- update");
+    println!("  1. Run: cargo run --bin deploy -- update {}", config.venue);
     println!("  2. Check logs and set up alerting in Cloud Console, if desired");
 
     Ok(())
 }
 
 #[rustfmt::skip]
-fn deploy_code() -> Result<()> {
+fn deploy_code(config: &DeployConfig) -> Result<()> {
     println!("Deploying code to instance...");
 
     // Re-run setup script first
     println!("Re-running setup script...");
     let mut temp_file = NamedTempFile::new().context("Failed to create temporary file")?;
-    temp_file.write_all(get_setup_script().as_bytes()).context("Failed to write setup script")?;
+    temp_file.write_all(get_setup_script(config).as_bytes()).context("Failed to write setup script")?;
 
     run_cmd(Command::new("gcloud")
         .args([
             "compute", "scp",
             temp_file.path().to_str().unwrap(),
-            &format!("{}:/tmp/setup.sh", INSTANCE_NAME),
+            &format!("{}:/tmp/setup.sh", config.instance_name),
             "--zone", ZONE
         ]), "Failed to copy setup script")?;
 
-    run_cmd(&mut gcloud_ssh_cmd("sudo bash /tmp/setup.sh"), "Setup script failed")?;
+    run_cmd(&mut gcloud_ssh_cmd(config, "sudo bash /tmp/setup.sh"), "Setup script failed")?;
 
     // Clean up old directory and sync source code
     println!("Cleaning up old files and syncing source code...");
-    run_cmd(&mut gcloud_ssh_cmd(&format!("sudo rm -rf /tmp/{}", SERVICE_NAME)), "Failed to clean up old files")?;
+    run_cmd(&mut gcloud_ssh_cmd(config, &format!("sudo rm -rf /tmp/{}", config.service_name)), "Failed to clean up old files")?;
     
     run_cmd(Command::new("gcloud")
         .args([
             "compute", "scp", "--recurse",
             "cli/", "collector/", "deploy/", "tests/", "Cargo.toml", "Cargo.lock",
-            &format!("{}:/tmp/{}-source", INSTANCE_NAME, SERVICE_NAME),
+            &format!("{}:/tmp/{}-source", config.instance_name, config.service_name),
             "--zone", ZONE
         ]), "Failed to sync source code")?;
 
@@ -287,25 +321,25 @@ fn deploy_code() -> Result<()> {
          sudo systemctl stop {service} && \
          sudo cp /tmp/{service}-build/target/release/{bin} {app}/ && \
          sudo systemctl start {service}",
-        user = USER_NAME, app = APP_DIR, bin = BINARY_NAME, service = SERVICE_NAME
+        user = config.user_name, app = config.app_dir, bin = BINARY_NAME, service = config.service_name
     );
-    run_cmd(&mut gcloud_ssh_cmd(&deploy_cmd), "Failed to build and deploy")?;
+    run_cmd(&mut gcloud_ssh_cmd(config, &deploy_cmd), "Failed to build and deploy")?;
 
     // Check status
     std::thread::sleep(std::time::Duration::from_secs(3));
     println!("Checking service status...");
-    run_cmd(&mut gcloud_ssh_cmd(&format!("sudo systemctl status {} --no-pager", SERVICE_NAME)), 
+    run_cmd(&mut gcloud_ssh_cmd(config, &format!("sudo systemctl status {} --no-pager", config.service_name)), 
             "Failed to check status")?;
 
     println!("✅ Deployment complete!");
     println!("Monitor logs: gcloud compute ssh {} --zone {} --command 'sudo journalctl -u {} -f'", 
-             INSTANCE_NAME, ZONE, SERVICE_NAME);
+             config.instance_name, ZONE, config.service_name);
 
     Ok(())
 }
 
 #[rustfmt::skip]
-fn destroy_instance() -> Result<()> {
+fn destroy_instance(config: &DeployConfig) -> Result<()> {
     println!("⚠️  This will destroy the instance and all local data!");
     print!("Type 'yes' to confirm: ");
     std::io::stdout().flush()?;
@@ -321,25 +355,25 @@ fn destroy_instance() -> Result<()> {
     println!("\nDestroying instance...");
     run_cmd(Command::new("gcloud")
         .args([
-            "compute", "instances", "delete", INSTANCE_NAME,
+            "compute", "instances", "delete", config.instance_name,
             "--zone", ZONE,
             "--quiet"
         ]), "Failed to destroy instance")?;
 
     println!("✅ Instance destroyed.");
-    println!("Note: Bucket {} was not deleted (contains your data).", BUCKET_NAME);
+    println!("Note: Bucket {} was not deleted (contains your data).", config.bucket_name);
 
     Ok(())
 }
 
 #[rustfmt::skip]
-fn check_status() -> Result<()> {
+fn check_status(config: &DeployConfig) -> Result<()> {
     println!("Checking instance status...");
     
-    println!("gcloud compute instances describe {} --zone {} --format value(status)", INSTANCE_NAME, ZONE);
+    println!("gcloud compute instances describe {} --zone {} --format value(status)", config.instance_name, ZONE);
     let status = Command::new("gcloud")
         .args([
-            "compute", "instances", "describe", INSTANCE_NAME,
+            "compute", "instances", "describe", config.instance_name,
             "--zone", ZONE,
             "--format", "value(status)"
         ])
@@ -348,11 +382,11 @@ fn check_status() -> Result<()> {
     match status {
         Ok(s) if s.success() => {
             println!("Instance is running.");
-            println!("To ssh into the instance, run: gcloud compute ssh {} --zone {}", INSTANCE_NAME, ZONE);
+            println!("To ssh into the instance, run: gcloud compute ssh {} --zone {}", config.instance_name, ZONE);
             
             // Check service status
             println!("Checking service status...");
-            run_cmd(&mut gcloud_ssh_cmd(&format!("sudo systemctl status {} --no-pager", SERVICE_NAME)),
+            run_cmd(&mut gcloud_ssh_cmd(config, &format!("sudo systemctl status {} --no-pager", config.service_name)),
                     "Failed to check service status")?;
         },
         _ => {
@@ -364,7 +398,7 @@ fn check_status() -> Result<()> {
     Ok(())
 }
 
-fn wait_for_instance_ready() -> Result<()> {
+fn wait_for_instance_ready(config: &DeployConfig) -> Result<()> {
     println!("Waiting for instance to be ready...");
     let interval_secs = 5;
     let max_attempts = 30;
@@ -376,7 +410,7 @@ fn wait_for_instance_ready() -> Result<()> {
                 "compute",
                 "instances",
                 "describe",
-                INSTANCE_NAME,
+                config.instance_name,
                 "--zone",
                 ZONE,
                 "--format",
@@ -393,7 +427,7 @@ fn wait_for_instance_ready() -> Result<()> {
                 .args([
                     "compute",
                     "ssh",
-                    INSTANCE_NAME,
+                    config.instance_name,
                     "--zone",
                     ZONE,
                     "--command",
@@ -428,12 +462,12 @@ fn run_cmd(cmd: &mut Command, error_msg: &str) -> Result<()> {
     Ok(())
 }
 
-fn gcloud_ssh_cmd(command: &str) -> Command {
+fn gcloud_ssh_cmd(config: &DeployConfig, command: &str) -> Command {
     let mut cmd = Command::new("gcloud");
     cmd.args([
         "compute",
         "ssh",
-        INSTANCE_NAME,
+        config.instance_name,
         "--zone",
         ZONE,
         "--command",

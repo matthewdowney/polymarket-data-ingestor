@@ -1,7 +1,8 @@
 use anyhow::Result;
 use chrono::Utc;
-use data_collector::{client, PolymarketMarket};
-use futures::StreamExt;
+use clap::Parser;
+use data_collector::{client, kalshi_client, FeedEvent, KalshiCredentials};
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -31,7 +32,7 @@ impl LoggedMessage {
         }
     }
 
-    fn new_active_markets(markets: &[PolymarketMarket]) -> Self {
+    fn new_active_markets<T: Serialize>(markets: &[T]) -> Self {
         Self {
             timestamp: Utc::now().to_rfc3339(),
             message_type: "active_markets".to_string(),
@@ -69,7 +70,7 @@ impl LoggedMessage {
 }
 
 /// Handles feed events with automatic hourly file rotation
-struct FeedHandler {
+struct FeedHandler<M: Serialize> {
     data_dir: PathBuf,
     current_dir: PathBuf,
     current_writer: Option<Encoder<'static, BufWriter<File>>>,
@@ -83,10 +84,10 @@ struct FeedHandler {
     n_connections_open: usize,
     n_connections_total: usize,
 
-    active_markets: Vec<PolymarketMarket>,
+    active_markets: Vec<M>,
 }
 
-impl FeedHandler {
+impl<M: Serialize> FeedHandler<M> {
     fn new<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         let current_dir = data_dir.join("current");
@@ -209,7 +210,7 @@ impl FeedHandler {
         Ok(())
     }
 
-    fn set_active_markets(&mut self, markets: Vec<PolymarketMarket>) -> Result<()> {
+    fn set_active_markets(&mut self, markets: Vec<M>) -> Result<()> {
         self.active_markets = markets;
         self.emit_market_data()
     }
@@ -297,8 +298,23 @@ impl FeedHandler {
     }
 }
 
+#[derive(Parser)]
+#[command(name = "collector")]
+struct Args {
+    #[arg(value_enum)]
+    venue: Venue,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone)]
+enum Venue {
+    Polymarket,
+    Kalshi,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
     // Set up logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -308,14 +324,28 @@ async fn main() -> Result<()> {
         .init();
 
     // Log startup info via tracing
-    tracing::info!("Polymarket Data Collector starting up...");
+    tracing::info!("Data Collector starting up for venue: {:?}", args.venue);
     tracing::info!("Working directory: {:?}", std::env::current_dir()?);
     tracing::info!(
         "RUST_LOG: {:?}",
         std::env::var("RUST_LOG").unwrap_or_else(|_| "not set".to_string())
     );
 
-    // Set up feed handler with the correct data directory
+    match args.venue {
+        Venue::Polymarket => run_polymarket_collector().await,
+        Venue::Kalshi => {
+            dotenvy::dotenv()?;
+            let kalshi_api_key =
+                std::env::var("KALSHI_API_KEY").expect("KALSHI_API_KEY must be set");
+            let credentials =
+                KalshiCredentials::from_file(&kalshi_api_key, "./kalshi_private_key.pem")
+                    .expect("Failed to load Kalshi credentials");
+            run_kalshi_collector(credentials).await
+        }
+    }
+}
+
+async fn run_polymarket_collector() -> Result<()> {
     let base_path = PathBuf::from("./data");
     tracing::info!(
         "Data directory: {:?}",
@@ -329,14 +359,6 @@ async fn main() -> Result<()> {
     let cancel = CancellationToken::new();
     let client = client::PolymarketClient::new(cancel.clone());
 
-    // Fetch markets
-
-    // let markets = client.fetch_sampling_markets().await?;
-    // tracing::info!(
-    //     market_count = markets.len(),
-    //     "found sampling markets, connecting..."
-    // );
-
     let markets = client.fetch_active_markets().await?;
     tracing::info!(
         market_count = markets.len(),
@@ -349,6 +371,44 @@ async fn main() -> Result<()> {
     // Get stream of events for these markets
     let (mut stream, client_handle) = client.into_stream(markets).await?;
 
+    run_event_loop(&mut handler, &mut stream, cancel, client_handle).await
+}
+
+async fn run_kalshi_collector(credentials: KalshiCredentials) -> Result<()> {
+    let base_path = PathBuf::from("./data");
+    tracing::info!(
+        "Data directory: {:?}",
+        base_path
+            .canonicalize()
+            .unwrap_or_else(|_| base_path.clone())
+    );
+    let mut handler = FeedHandler::new(base_path)?;
+
+    // Create client to fetch markets from API
+    let cancel = CancellationToken::new();
+    let client = kalshi_client::KalshiClient::new(cancel.clone());
+
+    let markets = client.fetch_active_markets().await?;
+    tracing::info!(
+        market_count = markets.len(),
+        "found active markets, connecting..."
+    );
+
+    // Store market data in handler and emit as first log line
+    handler.set_active_markets(markets.clone())?;
+
+    // Get stream of events for these markets
+    let (mut stream, client_handle) = client.into_stream(credentials, markets).await?;
+
+    run_event_loop(&mut handler, &mut stream, cancel, client_handle).await
+}
+
+async fn run_event_loop<M: Serialize>(
+    handler: &mut FeedHandler<M>,
+    stream: &mut (impl Stream<Item = FeedEvent> + std::marker::Unpin),
+    cancel: CancellationToken,
+    client_handle: tokio::task::JoinHandle<()>,
+) -> Result<()> {
     // Set up signal handlers for SIGINT, SIGTERM, and SIGHUP
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -359,11 +419,11 @@ async fn main() -> Result<()> {
         tokio::select! {
             event = stream.next() => {
                 match event {
-                    Some(client::FeedEvent::FeedMessage(msg)) => handler.handle_message(msg)?,
-                    Some(client::FeedEvent::ConnectionOpened(_id, n_open, n_connections)) => {
+                    Some(FeedEvent::FeedMessage(msg)) => handler.handle_message(msg)?,
+                    Some(FeedEvent::ConnectionOpened(_id, n_open, n_connections)) => {
                         handler.handle_connection_opened(n_open, n_connections)?
                     }
-                    Some(client::FeedEvent::ConnectionClosed(_id, n_open, n_connections)) => {
+                    Some(FeedEvent::ConnectionClosed(_id, n_open, n_connections)) => {
                         handler.handle_connection_closed(n_open, n_connections)?
                     }
                     None => {

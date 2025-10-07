@@ -1,6 +1,5 @@
-use crate::client::connection::Connection;
-use crate::client::{split_markets, MAX_PARALLELISM};
-use crate::{ConnectionEvent, ConnectionId};
+use crate::kalshi_client::{split_markets, MAX_PARALLELISM};
+use crate::kalshi_client::{Connection, ConnectionEvent, ConnectionId};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -281,6 +280,7 @@ impl Reconnecter {
     pub fn split_connection(&mut self, id: ConnectionId) -> Option<(ConnectionId, ConnectionId)> {
         // Remove the original connection
         let original_connection = self.connections.remove(&id)?;
+        let credentials = original_connection.try_lock().ok()?.credentials.clone();
 
         // Extract the connection to get its markets (this will block briefly)
         let markets = {
@@ -306,11 +306,13 @@ impl Reconnecter {
         // Create new connections
         let first_connection = Connection::new(
             first_id.clone(),
+            credentials.clone(),
             first_markets.clone(),
             self.event_tx.clone(),
         );
         let second_connection = Connection::new(
             second_id.clone(),
+            credentials.clone(),
             second_markets.clone(),
             self.event_tx.clone(),
         );
@@ -328,24 +330,24 @@ impl Reconnecter {
         );
 
         // Log individual market isolation if we get down to single markets
-        if first_markets.len() == 1 {
-            if let Some(market_id) = first_markets.first().and_then(|m| m.id.as_ref()) {
-                tracing::warn!(
-                    connection_id = ?first_id,
-                    market_id = market_id,
-                    "problematic_market_isolated"
-                );
-            }
-        }
-        if second_markets.len() == 1 {
-            if let Some(market_id) = second_markets.first().and_then(|m| m.id.as_ref()) {
-                tracing::warn!(
-                    connection_id = ?second_id,
-                    market_id = market_id,
-                    "problematic_market_isolated"
-                );
-            }
-        }
+        // if first_markets.len() == 1 {
+        //     if let Some(ticker) = first_markets.first().and_then(|m| m.ticker.as_ref()) {
+        //         tracing::warn!(
+        //             connection_id = ?first_id,
+        //             market_id = ticker,
+        //             "problematic_market_isolated"
+        //         );
+        //     }
+        // }
+        // if second_markets.len() == 1 {
+        //     if let Some(market_id) = second_markets.first().and_then(|m| m.ticker.as_ref()) {
+        //         tracing::warn!(
+        //             connection_id = ?second_id,
+        //             market_id = market_id,
+        //             "problematic_market_isolated"
+        //         );
+        //     }
+        // }
 
         Some((first_id, second_id))
     }

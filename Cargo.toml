@@ -26,3 +26,8 @@ zstd = "0.13"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.10"
 clap = { version = "4", features = ["derive"] }
+rand = "0.8.5"
+rsa = "0.9.8"
+rust_decimal = "1.38.0"
+sha2 = "0.10.9"
+dotenvy = "0.15.7"

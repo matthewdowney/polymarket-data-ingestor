@@ -1,5 +1,5 @@
 use anyhow::Result;
-use data_collector::client;
+use data_collector::{client, FeedEvent};
 use futures::StreamExt;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -38,10 +38,10 @@ async fn test_feed_connections() -> Result<()> {
     let _result = timeout(CONNECTION_TIMEOUT, async {
         while let Some(event) = stream.next().await {
             match event {
-                client::FeedEvent::FeedMessage(_) => {
+                crate::FeedEvent::FeedMessage(_) => {
                     // Ignore feed messages for this test
                 }
-                client::FeedEvent::ConnectionOpened(_id, n_open, n_connections) => {
+                crate::FeedEvent::ConnectionOpened(_id, n_open, n_connections) => {
                     n_connections_open = n_open;
                     n_connections_total = n_connections;
                     if n_open == n_connections {
@@ -50,7 +50,7 @@ async fn test_feed_connections() -> Result<()> {
                         break;
                     }
                 }
-                client::FeedEvent::ConnectionClosed(_id, n_open, n_connections) => {
+                crate::FeedEvent::ConnectionClosed(_id, n_open, n_connections) => {
                     n_connections_open = n_open;
                     n_connections_total = n_connections;
                 }
@@ -70,7 +70,7 @@ async fn test_feed_connections() -> Result<()> {
     cancel.cancel();
     let shutdown_result = timeout(SHUTDOWN_TIMEOUT, async {
         while let Some(event) = stream.next().await {
-            if let client::FeedEvent::ConnectionClosed(_, n_open, _) = event {
+            if let crate::FeedEvent::ConnectionClosed(_, n_open, _) = event {
                 if n_open == 0 {
                     break;
                 }

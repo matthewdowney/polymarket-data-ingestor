@@ -4,11 +4,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::gcs_downloader::GcsDownloader;
+use super::Venue;
 
 pub struct HistoricalDataReader {
     cache_dir: PathBuf,
     start_timestamp: DateTime<Utc>,
     end_timestamp: DateTime<Utc>,
+    venue: Venue,
 }
 
 impl HistoricalDataReader {
@@ -16,17 +18,22 @@ impl HistoricalDataReader {
         cache_dir: PathBuf,
         start_timestamp: DateTime<Utc>,
         end_timestamp: DateTime<Utc>,
+        venue: Venue,
     ) -> Self {
         Self {
             cache_dir,
             start_timestamp,
             end_timestamp,
+            venue,
         }
     }
 
     /// Download required files from GCS
     pub async fn download_from_gcs(&self) -> Result<()> {
-        let downloader = GcsDownloader::new(self.cache_dir.clone()).await?;
+        let downloader = match self.venue {
+            Venue::Polymarket => GcsDownloader::new_polymarket(self.cache_dir.clone()).await?,
+            Venue::Kalshi => GcsDownloader::new_kalshi(self.cache_dir.clone()).await?,
+        };
 
         println!(
             "Downloading files from GCS for time range {} to {}",

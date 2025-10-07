@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, DurationRound, Utc};
 use clap::{CommandFactory, Parser, Subcommand};
 use cli::file_reader::HistoricalDataReader;
+use cli::Venue;
 use data_collector::PolymarketMarket;
 use std::{io::IsTerminal, path::PathBuf};
 
@@ -23,6 +24,8 @@ fn get_colors() -> (&'static str, &'static str, &'static str) {
 struct Args {
     #[command(subcommand)]
     command: Commands,
+    #[arg(value_enum)]
+    venue: Venue,
 }
 
 #[derive(Subcommand)]
@@ -103,13 +106,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match &args.command {
-        Commands::Download(download_args) => run_download(download_args).await,
-        Commands::Replay(replay_args) => run_replay(replay_args).await,
-        Commands::Markets(markets_args) => run_markets(markets_args).await,
+        Commands::Download(download_args) => run_download(download_args, args.venue).await,
+        Commands::Replay(replay_args) => run_replay(replay_args, args.venue).await,
+        Commands::Markets(markets_args) => run_markets(markets_args, args.venue).await,
     }
 }
 
-async fn run_download(args: &DownloadArgs) -> Result<()> {
+async fn run_download(args: &DownloadArgs, venue: Venue) -> Result<()> {
     if args.since.is_none() && args.start.is_none() && args.end.is_none() {
         let _ = DownloadArgs::command().print_help();
         std::process::exit(1);
@@ -117,7 +120,7 @@ async fn run_download(args: &DownloadArgs) -> Result<()> {
     let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
 
     let cache_dir = PathBuf::from(DATA_DIR);
-    let reader = HistoricalDataReader::new(cache_dir, start, end);
+    let reader = HistoricalDataReader::new(cache_dir, start, end, venue);
     reader.download_from_gcs().await?;
 
     // Discover files in cache directory
@@ -129,7 +132,7 @@ async fn run_download(args: &DownloadArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_replay(args: &ReplayArgs) -> Result<()> {
+async fn run_replay(args: &ReplayArgs, venue: Venue) -> Result<()> {
     if args.since.is_none() && args.start.is_none() && args.end.is_none() {
         let _ = DownloadArgs::command().print_help();
         std::process::exit(1);
@@ -137,7 +140,7 @@ async fn run_replay(args: &ReplayArgs) -> Result<()> {
 
     let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
     let cache_dir = PathBuf::from(DATA_DIR);
-    let reader = HistoricalDataReader::new(cache_dir, start, end);
+    let reader = HistoricalDataReader::new(cache_dir, start, end, venue);
 
     // Read the files in order, keep track of market state, and write ticks to the output file
     let mut state = cli::tick_generator::MarketState::default();
@@ -168,13 +171,13 @@ async fn run_replay(args: &ReplayArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_markets(args: &MarketsArgs) -> Result<()> {
+async fn run_markets(args: &MarketsArgs, venue: Venue) -> Result<()> {
     let today = Utc::now().format("%Y-%m-%d").to_string();
     let start = args.start.clone().unwrap_or("1970-01-01".to_string());
 
     let (start, end) = parse_time_range(args.since.clone(), Some(start), Some(today))?;
     let cache_dir = PathBuf::from(DATA_DIR);
-    let reader = HistoricalDataReader::new(cache_dir, start, end);
+    let reader = HistoricalDataReader::new(cache_dir, start, end, venue);
 
     // Use first file in range if provided, otherwise use most recent file
     let files = reader.discover_files_with_gcs_cache()?;

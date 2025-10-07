@@ -5,3 +5,5 @@
 terraform-deployer-key.json
 .terraform*
 terraform.tfstate*
+.env
+kalshi_private_key.pem
