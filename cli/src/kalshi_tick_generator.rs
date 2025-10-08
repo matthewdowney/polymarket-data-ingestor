@@ -238,6 +238,7 @@ pub struct MarketState {
 struct Book {
     asks: BTreeMap<Decimal, Decimal>,
     bids: BTreeMap<Decimal, Decimal>,
+    is_initialized: bool,
 }
 
 impl Book {
@@ -254,11 +255,15 @@ impl Book {
             self.bids.insert(lvl[0] / Decimal::from(100), lvl[1]);
         }
 
+        self.is_initialized = true;
         self
     }
 
     /// Update book state from a Kalshi diff message
     fn update_from_delta(&mut self, m: &KalshiOrderbookDelta) -> &Self {
+        if !self.is_initialized {
+            return self;
+        }
         let (book_side, price) = match m.side {
             KalshiSide::No => {
                 let neg_price = (Decimal::from(100) - m.price) / Decimal::from(100);
@@ -340,11 +345,11 @@ impl MarketState {
                     }
                 }
 
-                self.books
-                    .entry(msg.market_ticker.clone())
-                    .or_default()
-                    .reset_from_snapshot(&msg)
-                    .write_bbo(w, timestamp, msg.market_ticker)?;
+                let book = self.books.entry(msg.market_ticker.clone()).or_default();
+                book.reset_from_snapshot(&msg);
+                book.is_initialized = true;
+
+                book.write_bbo(w, timestamp, msg.market_ticker)?;
             }
             FeedMessage::OrderbookDelta { msg, .. } => {
                 if let Some(market_tickers) = &self.market_tickers {
@@ -392,7 +397,8 @@ enum FeedMessage {
     Trade { msg: KalshiPublicTrade },
 
     #[serde(rename = "ticker")]
-    Ticker { _sid: u64, _msg: KalshiTicker },
+    #[allow(dead_code)]
+    Ticker { sid: u64, msg: KalshiTicker },
 
     #[serde(other)]
     Other,
