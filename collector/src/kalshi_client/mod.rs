@@ -1,5 +1,4 @@
 mod connection;
-mod reconnector;
 
 use std::time::Duration;
 
@@ -13,16 +12,14 @@ pub const WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 pub const INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often to send application-level pings to the server
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
-/// Maximum number of connections to open at once.
-pub const MAX_PARALLELISM: usize = 50;
+/// We only open one connection on Kalshi, so we assign ID to 0.
+const CONNECTION_ID: ConnectionId = ConnectionId(0);
 
 use crate::kalshi_client::connection::Connection;
-use crate::kalshi_client::reconnector::Reconnecter;
 use crate::{ConnectionEvent, ConnectionId, FeedEvent, FeedEventStream};
 use crate::{KalshiCredentials, KalshiMarket, KalshiMarketsApiResponse};
 use anyhow::Result;
 use reqwest;
-use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -60,94 +57,75 @@ impl KalshiClient {
         markets: Vec<KalshiMarket>,
         tx: mpsc::Sender<FeedEvent>,
     ) {
-        // Distribute the markets across connections
-        let connection =
-            Connection::new(ConnectionId(0), credentials, markets, self.event_tx.clone());
+        let mut connection = Connection::new(credentials, markets, self.event_tx.clone());
 
-        // Spawn a reconnecter task
-        let cancel_reconnecter = CancellationToken::new();
-        let mut reconnecter = Reconnecter::new(
-            HashMap::from([(ConnectionId(0), connection)]),
-            self.event_tx.clone(),
-            cancel_reconnecter.clone(),
-        );
-        let reconnecter_tx = reconnecter.tx.clone();
-        let reconnecter_handle = tokio::spawn(async move { reconnecter.run().await });
+        let cancel_clone = self.cancel.clone();
+        let connection_handle = tokio::spawn(async move {
+            if let Err(e) = connection.connect().await {
+                tracing::error!(error = %e, "initial connection failed");
+                return;
+            }
 
-        // Initial connection requests
-        tracing::info!(connection_count = 1, "requesting socket connections");
-        if let Err(e) = reconnecter_tx.send(ConnectionId(0)) {
-            tracing::error!(error = %e, "error sending initial connection request");
-            return;
-        }
+            loop {
+                tokio::select! {
+                    result = connection.run_until_closed() => {
+                        match result {
+                            Ok(()) => {
+                                tracing::info!("connection closed");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "connection error");
+                            }
+                        }
 
-        // Wait for self to finish
-        self.handle_events(reconnecter_tx, tx, 1).await;
+                        let mut backoff = Duration::from_secs(1);
+                        loop {
+                            tokio::select! {
+                                _ = tokio::time::sleep(backoff) => {
+                                    match connection.connect().await {
+                                        Ok(()) => {
+                                            tracing::info!("reconnected successfully");
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, backoff_secs = backoff.as_secs(), "reconnection failed, retrying");
+                                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                                        }
+                                    }
+                                }
+                                _ = cancel_clone.cancelled() => return,
+                            }
+                        }
+                    }
+                    _ = cancel_clone.cancelled() => {
+                        tracing::info!("shutdown request received, stopping reconnection attempts");
+                        let _ = connection.close().await;
+                        return;
+                    }
+                }
+            }
+        });
 
-        // Wait for the reconnecter to finish
-        cancel_reconnecter.cancel();
-        let _ = reconnecter_handle.await;
+        self.handle_events(tx).await;
+
+        let _ = connection_handle.await;
     }
 
-    /// Loop until the cancel token is cancelled, passing events to the message handler
-    /// and requesting reconnects when a connection closes.
-    async fn handle_events(
-        &mut self,
-        rtx: mpsc::UnboundedSender<ConnectionId>,
-        client_tx: mpsc::Sender<FeedEvent>,
-        _n_connections: usize,
-    ) {
-        let mut n_open = 0;
-        let mut id_is_open = HashMap::new();
-
+    async fn handle_events(&mut self, client_tx: mpsc::Sender<FeedEvent>) {
         loop {
-            // Get the next event or stop early if the cancel token is cancelled
             let event = tokio::select! {
                 event = self.event_rx.recv() => event,
                 _ = self.cancel.cancelled() => break,
             };
 
             if let Some(event) = event {
-                let (should_continue, feed_event) = match event {
-                    ConnectionEvent::FeedMessage(msg) => (true, FeedEvent::FeedMessage(msg)),
-                    ConnectionEvent::ConnectionOpened(id) => {
-                        n_open += 1;
-                        id_is_open.insert(id.clone(), true);
-                        // Use best-effort calculation that accounts for connection splitting
-                        // When splits occur, total connections can exceed initial count
-                        let pending_connections = MAX_CONNECTIONS.saturating_sub(n_open);
-                        let current_total = id_is_open.len() + pending_connections;
-                        (true, FeedEvent::ConnectionOpened(id, n_open, current_total))
-                    }
-                    ConnectionEvent::ConnectionClosed(id) => {
-                        // Only decrement the open count if the connection was actually open,
-                        // not if it failed during the initial connection attempt.
-                        let was_open = id_is_open.remove(&id).is_some();
-                        if was_open {
-                            n_open -= 1;
-                        }
-
-                        // Use best-effort calculation that accounts for connection splitting
-                        // When splits occur, total connections can exceed initial count
-                        let pending_connections = MAX_CONNECTIONS.saturating_sub(n_open);
-                        let current_total = id_is_open.len() + pending_connections;
-
-                        // Send reconnection request
-                        if let Err(e) = rtx.send(id.clone()) {
-                            tracing::error!(connection_id = ?id, error = %e, "failed to send reconnection request - reconnecter channel closed");
-                            (
-                                false,
-                                FeedEvent::ConnectionClosed(id, n_open, current_total),
-                            )
-                        } else {
-                            tracing::debug!(connection_id = ?id, "successfully sent reconnection request");
-                            (true, FeedEvent::ConnectionClosed(id, n_open, current_total))
-                        }
-                    }
+                let feed_event = match event {
+                    ConnectionEvent::FeedMessage(msg) => FeedEvent::FeedMessage(msg),
+                    ConnectionEvent::ConnectionOpened(id) => FeedEvent::ConnectionOpened(id, 1, 1),
+                    ConnectionEvent::ConnectionClosed(id) => FeedEvent::ConnectionClosed(id, 0, 1),
                 };
 
-                // Forward to client
-                if client_tx.send(feed_event).await.is_err() || !should_continue {
+                if client_tx.send(feed_event).await.is_err() {
                     break;
                 }
             } else {
@@ -269,12 +247,6 @@ impl KalshiClient {
             (page.into_vec(), next_cursor)
         })
     }
-}
-
-pub(crate) fn split_markets(markets: Vec<KalshiMarket>) -> (Vec<KalshiMarket>, Vec<KalshiMarket>) {
-    let mid = markets.len() / 2;
-    let (first_half, second_half) = markets.split_at(mid);
-    (first_half.to_vec(), second_half.to_vec())
 }
 
 pub trait PaginatedResponse<T> {

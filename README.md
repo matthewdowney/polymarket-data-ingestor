@@ -20,7 +20,7 @@ Requires [gcloud](https://cloud.google.com/sdk/docs/install) cli installed and a
 
 ```bash
 # Stream real-time data
-cargo run --bin [venue] collector
+cargo run --bin collector [venue]
 
 # Download historical data
 cargo run --bin cli [venue] download --since 24h
