@@ -36,9 +36,10 @@ impl HistoricalDataReader {
         };
 
         println!(
-            "Downloading files from GCS for time range {} to {}",
+            "Downloading files from GCS for time range {} to {} on venue {:?}",
             self.start_timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
-            self.end_timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+            self.end_timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
+            self.venue,
         );
 
         let downloaded_files = downloader
@@ -51,7 +52,11 @@ impl HistoricalDataReader {
 
     /// Discover files including GCS cache directory
     pub fn discover_files_with_gcs_cache(&self) -> Result<Vec<PathBuf>> {
-        let mut cache_files = self.discover_files_in_directory(&self.cache_dir)?;
+        let venue_dir = match self.venue {
+            Venue::Polymarket => self.cache_dir.join("polymarket"),
+            Venue::Kalshi => self.cache_dir.join("kalshi"),
+        };
+        let mut cache_files = self.discover_files_in_directory(&venue_dir)?;
         cache_files.sort();
         Ok(cache_files)
     }

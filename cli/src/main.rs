@@ -1,105 +1,14 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, DurationRound, Utc};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser};
+use cli::args::{Args, Commands, DownloadArgs, MarketsArgs, ReplayArgs};
 use cli::file_reader::HistoricalDataReader;
+use cli::get_handler;
 use cli::Venue;
-use data_collector::{KalshiMarket, PolymarketMarket};
-use std::{io::IsTerminal, path::PathBuf};
+use std::path::PathBuf;
 
 /// Directory where raw feed logs are cached
 const DATA_DIR: &str = "./data/gcs_cache";
-
-/// Terminal color codes - empty strings if not outputting to terminal
-fn get_colors() -> (&'static str, &'static str, &'static str) {
-    if std::io::stdout().is_terminal() {
-        ("\x1b[90m", "\x1b[32m", "\x1b[0m") // gray, green, reset
-    } else {
-        ("", "", "") // no colors when piped
-    }
-}
-
-#[derive(Parser)]
-#[command(name = "cli")]
-/// Polymarket historical data download and replay tools
-struct Args {
-    #[command(subcommand)]
-    command: Commands,
-    #[arg(value_enum)]
-    venue: Venue,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Download data for a given timeframe
-    Download(DownloadArgs),
-    /// Replay raw messages and generate tick data
-    Replay(ReplayArgs),
-    /// Print information about the listed markets
-    Markets(MarketsArgs),
-}
-
-#[derive(Parser)]
-/// Download data for a given timeframe
-struct DownloadArgs {
-    /// A duration string in hours or days (e.g. "12h", "2d")
-    #[arg(long, short = 't')]
-    since: Option<String>,
-
-    /// Start timestamp (RFC3339, ISO, or YYYY-MM-DD format)
-    #[arg(long)]
-    start: Option<String>,
-
-    /// End timestamp (RFC3339, ISO, or YYYY-MM-DD format)
-    #[arg(long)]
-    end: Option<String>,
-}
-
-#[derive(Parser)]
-/// Replay raw messages and generate tick data
-struct ReplayArgs {
-    /// A duration string in hours or days (e.g. "12h", "2d")
-    #[arg(long, short = 't')]
-    since: Option<String>,
-
-    /// Start timestamp (RFC3339, ISO, or YYYY-MM-DD format)
-    #[arg(long)]
-    start: Option<String>,
-
-    /// End timestamp (RFC3339, ISO, or YYYY-MM-DD format)
-    #[arg(long)]
-    end: Option<String>,
-
-    /// Path to the output CSV file (defaults to stdout)
-    #[arg(long, short)]
-    output: Option<String>,
-
-    /// Specific market ids to replay (can be specified multiple times)
-    #[arg(long, short = 'm', num_args = 1..)]
-    markets: Option<Vec<String>>,
-}
-
-#[derive(Parser)]
-/// Print information about the listed markets
-struct MarketsArgs {
-    /// Optional market name filter (case-insensitive)
-    filter: Option<String>,
-
-    /// How long ago to query market info from (e.g. "12h", "2d")
-    #[arg(long, short = 't')]
-    since: Option<String>,
-
-    /// Date on which to query market info (RFC3339, ISO, or YYYY-MM-DD format)
-    #[arg(long)]
-    start: Option<String>,
-
-    /// Print raw JSON (default: false)
-    #[arg(long, default_value_t = false)]
-    raw: bool,
-
-    /// Print as CSV (default: false)
-    #[arg(long, default_value_t = false)]
-    csv: bool,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -120,7 +29,7 @@ async fn run_download(args: &DownloadArgs, venue: Venue) -> Result<()> {
     let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
 
     let cache_dir = PathBuf::from(DATA_DIR);
-    let reader = HistoricalDataReader::new(cache_dir, start, end, venue);
+    let reader = HistoricalDataReader::new(cache_dir, start, end, venue.clone());
     reader.download_from_gcs().await?;
 
     // Discover files in cache directory
@@ -153,33 +62,9 @@ async fn run_replay(args: &ReplayArgs, venue: Venue) -> Result<()> {
         PathBuf::from("output.parquet")
     };
 
-    match venue {
-        Venue::Polymarket => {
-            let mut state = cli::tick_generator::MarketState::default();
-            if let Some(markets) = args.markets.clone() {
-                state.with_market_filter(markets);
-            }
-            let mut parquet_writer = cli::tick_generator::ParquetTickWriter::new(output_path)?;
-            let files = reader.discover_files_with_gcs_cache()?;
-            for file in files {
-                cli::tick_generator::write_ticks(&file, &mut state, &mut parquet_writer)?;
-            }
-            parquet_writer.finish()?;
-        }
-        Venue::Kalshi => {
-            let mut state = cli::kalshi_tick_generator::MarketState::default();
-            if let Some(markets) = args.markets.clone() {
-                state.with_market_filter(markets);
-            }
-            let mut parquet_writer =
-                cli::kalshi_tick_generator::ParquetTickWriter::new(output_path)?;
-            let files = reader.discover_files_with_gcs_cache()?;
-            for file in files {
-                cli::kalshi_tick_generator::write_ticks(&file, &mut state, &mut parquet_writer)?;
-            }
-            parquet_writer.finish()?;
-        }
-    }
+    let files = reader.discover_files_with_gcs_cache()?;
+    let handler = get_handler(venue);
+    handler.write_ticks(&files, output_path, args.markets.clone())?;
 
     Ok(())
 }
@@ -194,89 +79,20 @@ async fn run_markets(args: &MarketsArgs, venue: Venue) -> Result<()> {
 
     // Use first file in range if provided, otherwise use most recent file
     let files = reader.discover_files_with_gcs_cache()?;
-    let file = if args.since.is_none() && args.start.is_none() {
-        files.into_iter().next_back()
-    } else {
-        files.into_iter().next()
-    };
+    let file = files
+        .into_iter()
+        .next()
+        .ok_or(anyhow!("no data files found"))?;
 
-    if let Some(file) = file {
-        let msg = match venue.clone() {
-            Venue::Polymarket => cli::tick_generator::read_market_info(&file)?,
-            Venue::Kalshi => cli::kalshi_tick_generator::read_market_info(&file)?,
-        };
+    let handler = get_handler(venue.clone());
+    let msg = handler.read_market_info(&file)?;
 
-        if args.raw {
-            println!("{}", serde_json::to_string(&msg)?);
-        } else {
-            print_markets(msg, args, venue.clone())?;
-        }
+    if args.raw {
+        println!("{}", serde_json::to_string(&msg)?);
     } else {
-        eprintln!(
-            "No data files found in time range -- use the `download` command to download data"
-        );
-        std::process::exit(1);
+        handler.print_markets(msg, args)?;
     }
 
-    Ok(())
-}
-
-fn print_markets(mut msg: serde_json::Value, args: &MarketsArgs, venue: Venue) -> Result<()> {
-    let (gray, green, reset) = get_colors();
-    let markets = msg
-        .get_mut("markets")
-        .ok_or(anyhow!("no markets field found"))?
-        .take();
-
-    match venue {
-        Venue::Polymarket => {
-            let markets: Vec<PolymarketMarket> = serde_json::from_value(markets)?;
-            if args.csv {
-                println!("question,question_id,outcome,token_id");
-            }
-            for market in markets {
-                if let Some(filter) = args.filter.as_ref() {
-                    if !market
-                        .question
-                        .to_lowercase()
-                        .contains(&filter.to_lowercase())
-                    {
-                        continue;
-                    }
-                }
-                if args.csv {
-                    for token in market.tokens {
-                        println!(
-                            "{},{},{},{}",
-                            market.question, market.question_id, token.outcome, token.token_id
-                        );
-                    }
-                } else {
-                    println!("{}", market.question);
-                    println!("  {}{}{}", gray, market.condition_id, reset);
-                    for token in market.tokens {
-                        print!("  {}{:<10}{}", green, token.outcome, reset);
-                        println!("  {}{}{}", gray, token.token_id, reset);
-                    }
-                }
-            }
-        }
-        Venue::Kalshi => {
-            let markets: Vec<KalshiMarket> = serde_json::from_value(markets)?;
-            if args.csv {
-                println!("title,ticker");
-            }
-            for market in markets {
-                if let Some(filter) = args.filter.as_ref() {
-                    if !market.title.to_lowercase().contains(&filter.to_lowercase()) {
-                        continue;
-                    }
-                }
-                println!("{}", market.title);
-                println!("  {}{}{}", gray, market.ticker, reset);
-            }
-        }
-    }
     Ok(())
 }
 

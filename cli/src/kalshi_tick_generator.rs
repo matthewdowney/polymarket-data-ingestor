@@ -13,7 +13,7 @@ use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use rust_decimal::{prelude::*, Decimal};
+use rust_decimal::{dec, prelude::*, Decimal};
 use serde::{Deserialize, Serialize};
 
 pub fn main() -> Result<()> {
@@ -209,8 +209,8 @@ struct Row {
 impl Row {
     fn from_trade(t: &KalshiPublicTrade) -> Self {
         let (side, price, size) = match t.taker_side {
-            KalshiSide::Yes => (Side::Bid, t.yes_price / Decimal::from(100), t.count),
-            KalshiSide::No => (Side::Ask, t.yes_price / Decimal::from(100), t.count),
+            KalshiSide::Yes => (Side::Bid, penny_price(t.yes_price), t.count),
+            KalshiSide::No => (Side::Ask, penny_price(t.yes_price), t.count),
         };
         Self {
             timestamp: t.ts.timestamp_millis(),
@@ -247,12 +247,12 @@ impl Book {
         self.asks.clear();
         for lvl in m.no.iter() {
             self.asks
-                .insert((Decimal::from(100) - lvl[0]) / Decimal::from(100), lvl[1]);
+                .insert(penny_price(Decimal::from(100) - lvl[0]), lvl[1]);
         }
 
         self.bids.clear();
         for lvl in m.yes.iter() {
-            self.bids.insert(lvl[0] / Decimal::from(100), lvl[1]);
+            self.bids.insert(penny_price(lvl[0]), lvl[1]);
         }
 
         self.is_initialized = true;
@@ -266,10 +266,10 @@ impl Book {
         }
         let (book_side, price) = match m.side {
             KalshiSide::No => {
-                let neg_price = (Decimal::from(100) - m.price) / Decimal::from(100);
+                let neg_price = penny_price(Decimal::from(100) - m.price);
                 (&mut self.asks, neg_price)
             }
-            KalshiSide::Yes => (&mut self.bids, m.price / Decimal::from(100)),
+            KalshiSide::Yes => (&mut self.bids, penny_price(m.price)),
         };
 
         let current_size = book_side.get(&price).copied().unwrap_or(Decimal::ZERO);
@@ -285,42 +285,38 @@ impl Book {
         self
     }
 
-    fn top(&self, side: Side) -> (Decimal, Decimal) {
+    fn top(&self, side: Side) -> Option<(Decimal, Decimal)> {
         match side {
             Side::Ask => self.asks.iter().next(),
             Side::Bid => self.bids.iter().next_back(),
         }
         .map(|(&px, &sz)| (px, sz))
-        .unwrap_or_default()
     }
 
     fn write_bbo(&self, w: &mut ParquetTickWriter, timestamp: i64, market: String) -> Result<()> {
-        let (ask_px, ask_sz) = self.top(Side::Ask);
-        let (bid_px, bid_sz) = self.top(Side::Bid);
-
-        if ask_px.is_zero() | bid_px.is_zero() {
-            return Ok(());
+        if let Some((ask_px, ask_sz)) = self.top(Side::Ask) {
+            let row = Row {
+                timestamp,
+                market: market.clone(),
+                price: ask_px,
+                size: ask_sz,
+                side: Side::Ask,
+                kind: "BBO",
+            };
+            w.write_tick(row)?;
         }
 
-        let row = Row {
-            timestamp,
-            market: market.clone(),
-            price: ask_px,
-            size: ask_sz,
-            side: Side::Ask,
-            kind: "BBO",
-        };
-        w.write_tick(row)?;
-
-        let row = Row {
-            timestamp,
-            market: market.clone(),
-            price: bid_px,
-            size: bid_sz,
-            side: Side::Bid,
-            kind: "BBO",
-        };
-        w.write_tick(row)?;
+        if let Some((bid_px, bid_sz)) = self.top(Side::Bid) {
+            let row = Row {
+                timestamp,
+                market: market.clone(),
+                price: bid_px,
+                size: bid_sz,
+                side: Side::Bid,
+                kind: "BBO",
+            };
+            w.write_tick(row)?;
+        }
 
         Ok(())
     }
@@ -331,18 +327,14 @@ impl MarketState {
     fn update(&mut self, m: FeedMessage, w: &mut ParquetTickWriter, timestamp: i64) -> Result<()> {
         match m {
             FeedMessage::Trade { msg, .. } => {
-                if let Some(market_tickers) = &self.market_tickers {
-                    if !market_tickers.contains(&msg.market_ticker) {
-                        return Ok(());
-                    }
+                if !self.should_include(&msg.market_ticker) {
+                    return Ok(());
                 }
                 w.write_tick(Row::from_trade(&msg))?;
             }
             FeedMessage::OrderbookSnapshot { msg, .. } => {
-                if let Some(market_tickers) = &self.market_tickers {
-                    if !market_tickers.contains(&msg.market_ticker) {
-                        return Ok(());
-                    }
+                if !self.should_include(&msg.market_ticker) {
+                    return Ok(());
                 }
 
                 let book = self.books.entry(msg.market_ticker.clone()).or_default();
@@ -352,10 +344,8 @@ impl MarketState {
                 book.write_bbo(w, timestamp, msg.market_ticker)?;
             }
             FeedMessage::OrderbookDelta { msg, .. } => {
-                if let Some(market_tickers) = &self.market_tickers {
-                    if !market_tickers.contains(&msg.market_ticker) {
-                        return Ok(());
-                    }
+                if !self.should_include(&msg.market_ticker) {
+                    return Ok(());
                 }
 
                 self.books
@@ -371,6 +361,12 @@ impl MarketState {
 
     pub fn with_market_filter(&mut self, markets: Vec<String>) {
         self.market_tickers = Some(markets.into_iter().collect());
+    }
+
+    fn should_include(&self, ticker: &str) -> bool {
+        self.market_tickers
+            .as_ref()
+            .is_none_or(|m| m.contains(ticker))
     }
 }
 
@@ -461,4 +457,8 @@ struct KalshiTicker {
 enum KalshiSide {
     Yes,
     No,
+}
+
+fn penny_price(price: Decimal) -> Decimal {
+    price / dec!(100)
 }

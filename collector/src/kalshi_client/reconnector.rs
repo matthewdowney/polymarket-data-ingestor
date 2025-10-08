@@ -280,12 +280,9 @@ impl Reconnecter {
     pub fn split_connection(&mut self, id: ConnectionId) -> Option<(ConnectionId, ConnectionId)> {
         // Remove the original connection
         let original_connection = self.connections.remove(&id)?;
-        let credentials = original_connection.try_lock().ok()?.credentials.clone();
-
-        // Extract the connection to get its markets (this will block briefly)
-        let markets = {
+        let (credentials, markets) = {
             let conn = original_connection.try_lock().ok()?;
-            conn.markets.clone()
+            (conn.credentials.clone(), conn.markets.clone())
         };
 
         // Cannot split if we have 1 or fewer markets
@@ -328,26 +325,6 @@ impl Reconnecter {
             new_connection_ids = ?[&first_id, &second_id],
             "connection_split_successful"
         );
-
-        // Log individual market isolation if we get down to single markets
-        // if first_markets.len() == 1 {
-        //     if let Some(ticker) = first_markets.first().and_then(|m| m.ticker.as_ref()) {
-        //         tracing::warn!(
-        //             connection_id = ?first_id,
-        //             market_id = ticker,
-        //             "problematic_market_isolated"
-        //         );
-        //     }
-        // }
-        // if second_markets.len() == 1 {
-        //     if let Some(market_id) = second_markets.first().and_then(|m| m.ticker.as_ref()) {
-        //         tracing::warn!(
-        //             connection_id = ?second_id,
-        //             market_id = market_id,
-        //             "problematic_market_isolated"
-        //         );
-        //     }
-        // }
 
         Some((first_id, second_id))
     }

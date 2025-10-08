@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -14,7 +15,7 @@ use crate::{ConnectionEvent, ConnectionId, KalshiCredentials, KalshiMarket};
 use tokio_util::sync::CancellationToken;
 
 /// Subscription ID for the next subscription message.
-pub static LAST_SUB_ID: u64 = 0;
+pub static LAST_SUB_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Represents a single WebSocket shard covering a subset of all markets
 #[derive(Debug)]
@@ -239,7 +240,7 @@ impl Connection {
             .collect::<Vec<_>>();
 
         let sub_msg = serde_json::json!({
-            "id": LAST_SUB_ID + 1,
+            "id": LAST_SUB_ID.fetch_add(1, Ordering::Relaxed) + 1,
             "cmd": "subscribe",
             "params": {
                 "channels": ["ticker", "trade", "orderbook_delta"],
