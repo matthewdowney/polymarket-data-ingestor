@@ -228,6 +228,21 @@ impl Connection {
                     msg = ws.next() => {
                         match msg {
                             Some(Ok(Message::Text(text))) => {
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                                    if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                                        match msg_type {
+                                            "error" => {
+                                                tracing::error!(message = %text, "received error from kalshi, closing connection");
+                                                break;
+                                            }
+                                            "unsubscribed" => {
+                                                tracing::warn!(message = %text, "received unsubscribed from kalshi, closing connection");
+                                                break;
+                                            }
+                                            _ => {} // ignore other message types for now
+                                        }
+                                    }
+                                }
                                 if let Err(e) = tx.send(ConnectionEvent::FeedMessage(text.to_string())).await {
                                     tracing::error!(error = %e, "failed to send message");
                                     break;
