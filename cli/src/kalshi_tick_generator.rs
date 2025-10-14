@@ -1,227 +1,10 @@
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    fs::File,
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::{HasMarketFilter, Row, Side, TickWriter};
 use anyhow::Result;
-use arrow::array::*;
-use arrow::datatypes::*;
-use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
-use rust_decimal::{dec, prelude::*, Decimal};
+use rust_decimal::{dec, Decimal};
 use serde::{Deserialize, Serialize};
-
-pub fn main() -> Result<()> {
-    let path = std::env::args()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("need file as arg"))?;
-    let from_path = PathBuf::from(path);
-    let to_path = from_path.with_extension("parquet");
-
-    let mut state = MarketState::default();
-    let mut parquet_writer = ParquetTickWriter::new(to_path)?;
-    write_ticks(&from_path, &mut state, &mut parquet_writer)?;
-    parquet_writer.finish()?;
-
-    Ok(())
-}
-
-pub struct ParquetTickWriter {
-    writer: ArrowWriter<File>,
-    schema: Arc<Schema>,
-    batch_size: usize,
-    timestamps: Vec<String>,
-    kinds: Vec<String>,
-    markets: Vec<String>,
-    sides: Vec<String>,
-    prices: Vec<f64>,
-    sizes: Vec<f64>,
-}
-
-impl ParquetTickWriter {
-    pub fn new(path: PathBuf) -> Result<Self> {
-        let file = File::create(path)?;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Utf8, false),
-            Field::new("kind", DataType::Utf8, false),
-            Field::new("market", DataType::Utf8, false),
-            Field::new("side", DataType::Utf8, false),
-            Field::new("price", DataType::Float64, false),
-            Field::new("size", DataType::Float64, false),
-        ]));
-
-        let props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::SNAPPY)
-            .build();
-
-        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-
-        Ok(Self {
-            writer,
-            schema,
-            batch_size: 10000,
-            timestamps: Vec::new(),
-            kinds: Vec::new(),
-            markets: Vec::new(),
-            sides: Vec::new(),
-            prices: Vec::new(),
-            sizes: Vec::new(),
-        })
-    }
-
-    fn write_tick(&mut self, row: Row) -> Result<()> {
-        self.timestamps.push(row.timestamp.to_string());
-        self.kinds.push(row.kind.to_string());
-        self.markets.push(row.market);
-        self.sides.push(match row.side {
-            Side::Bid => "BID".to_string(),
-            Side::Ask => "ASK".to_string(),
-        });
-        self.prices.push(row.price.to_f64().unwrap());
-        self.sizes.push(row.size.to_f64().unwrap());
-
-        if self.timestamps.len() >= self.batch_size {
-            self.flush_batch()?;
-        }
-
-        Ok(())
-    }
-
-    fn flush_batch(&mut self) -> Result<()> {
-        if self.timestamps.is_empty() {
-            return Ok(());
-        }
-
-        let timestamp_arr = Arc::new(StringArray::from(
-            self.timestamps.drain(..).collect::<Vec<_>>(),
-        ));
-        let kind_arr = Arc::new(StringArray::from(self.kinds.drain(..).collect::<Vec<_>>()));
-        let market_arr = Arc::new(StringArray::from(
-            self.markets.drain(..).collect::<Vec<_>>(),
-        ));
-        let side_arr = Arc::new(StringArray::from(self.sides.drain(..).collect::<Vec<_>>()));
-        let price_arr = Arc::new(Float64Array::from(
-            self.prices.drain(..).collect::<Vec<_>>(),
-        ));
-        let size_arr = Arc::new(Float64Array::from(self.sizes.drain(..).collect::<Vec<_>>()));
-
-        let batch = RecordBatch::try_new(
-            self.schema.clone(),
-            vec![
-                timestamp_arr,
-                kind_arr,
-                market_arr,
-                side_arr,
-                price_arr,
-                size_arr,
-            ],
-        )?;
-
-        self.writer.write(&batch)?;
-        Ok(())
-    }
-
-    pub fn finish(mut self) -> Result<()> {
-        self.flush_batch()?;
-        self.writer.close()?;
-        Ok(())
-    }
-}
-
-pub fn read_market_info(from_path: &Path) -> Result<serde_json::Value> {
-    let mut reader = BufReader::new(zstd::Decoder::new(File::open(from_path)?)?);
-
-    let mut line = String::new();
-    loop {
-        // Read next JSONL
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-
-        // Decode the frame and check if it contains feed messages or if we should skip
-        let frame: MessageFrame = serde_json::from_str(&line)?;
-        if frame.message_type == "active_markets" {
-            return Ok(frame.content);
-        }
-    }
-
-    Err(anyhow::anyhow!("no active_markets message found"))
-}
-
-/// Decompress and read the file, keeping track of market state, and write data points as CSV
-pub fn write_ticks(
-    from_path: &Path,
-    state: &mut MarketState,
-    writer: &mut ParquetTickWriter,
-) -> Result<()> {
-    let mut reader = BufReader::new(zstd::Decoder::new(File::open(from_path)?)?);
-
-    let mut line = String::new();
-    loop {
-        // Read next JSONL
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-
-        // Decode the frame and check if it contains feed messages or if we should skip
-        let frame: MessageFrame = serde_json::from_str(&line)?;
-        let frame_ts = parse_timestamp(&frame.timestamp)?;
-        let msgs: Vec<FeedMessage> = match frame.content {
-            serde_json::Value::String(s) if s != "PONG" => {
-                //eprintln!("S: {}", s);
-                vec![serde_json::from_str::<FeedMessage>(&s)?]
-            }
-            _ => continue,
-        };
-
-        // Update the market state for each feed message
-        for msg in msgs {
-            state.update(msg, writer, frame_ts)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn parse_timestamp(timestamp: &str) -> Result<i64> {
-    Ok(DateTime::parse_from_rfc3339(timestamp)?.timestamp_millis())
-}
-
-/// Each tick (trade or book update) is seralized as a row
-#[derive(Serialize, Debug, Clone)]
-struct Row {
-    timestamp: i64,
-    kind: &'static str, // "BBO" or "TRADE"
-    market: String,
-    side: Side,
-    price: Decimal,
-    size: Decimal,
-}
-
-impl Row {
-    fn from_trade(t: &KalshiPublicTrade) -> Self {
-        let (side, price, size) = match t.taker_side {
-            KalshiSide::Yes => (Side::Bid, penny_price(t.yes_price), t.count),
-            KalshiSide::No => (Side::Ask, penny_price(t.yes_price), t.count),
-        };
-        Self {
-            timestamp: t.ts.timestamp_millis(),
-            kind: "TRADE",
-            market: t.market_ticker.clone(),
-            side,
-            price,
-            size,
-        }
-    }
-}
 
 /// Market state is updated with each message from the feed
 #[derive(Default)]
@@ -293,11 +76,12 @@ impl Book {
         .map(|(&px, &sz)| (px, sz))
     }
 
-    fn write_bbo(&self, w: &mut ParquetTickWriter, timestamp: i64, market: String) -> Result<()> {
+    fn write_bbo(&self, w: &mut TickWriter, timestamp: String, market: String) -> Result<()> {
         if let Some((ask_px, ask_sz)) = self.top(Side::Ask) {
             let row = Row {
-                timestamp,
+                timestamp: timestamp.clone(),
                 market: market.clone(),
+                asset: None,
                 price: ask_px,
                 size: ask_sz,
                 side: Side::Ask,
@@ -310,6 +94,7 @@ impl Book {
             let row = Row {
                 timestamp,
                 market: market.clone(),
+                asset: None,
                 price: bid_px,
                 size: bid_sz,
                 side: Side::Bid,
@@ -324,13 +109,13 @@ impl Book {
 
 impl MarketState {
     /// Update the market state, write zero or more tick data rows with the writer
-    fn update(&mut self, m: FeedMessage, w: &mut ParquetTickWriter, timestamp: i64) -> Result<()> {
+    pub fn update(&mut self, m: FeedMessage, w: &mut TickWriter, timestamp: String) -> Result<()> {
         match m {
             FeedMessage::Trade { msg, .. } => {
                 if !self.should_include(&msg.market_ticker) {
                     return Ok(());
                 }
-                w.write_tick(Row::from_trade(&msg))?;
+                w.write_tick(Row::from_kalshi_trade(&msg))?;
             }
             FeedMessage::OrderbookSnapshot { msg, .. } => {
                 if !self.should_include(&msg.market_ticker) {
@@ -370,19 +155,15 @@ impl MarketState {
     }
 }
 
-/// Each log line is a JSON message frame
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct MessageFrame {
-    timestamp: String,
-    message_type: String,
-    /// When message_type = "feed_message", this is a string-encoded JSON array of FeedMessages
-    content: serde_json::Value,
+impl HasMarketFilter for MarketState {
+    fn with_market_filter(&mut self, markets: Vec<String>) {
+        self.with_market_filter(markets);
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-enum FeedMessage {
+pub enum FeedMessage {
     #[serde(rename = "orderbook_snapshot")]
     OrderbookSnapshot { msg: KalshiOrderbookSnapshot },
 
@@ -400,16 +181,10 @@ enum FeedMessage {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-enum Side {
-    Bid,
-    Ask,
-}
-
 // Structs for serde
 
 #[derive(Debug, Serialize, Deserialize)]
-struct KalshiOrderbookSnapshot {
+pub struct KalshiOrderbookSnapshot {
     market_ticker: String,
     market_id: String,
     #[serde(default)]
@@ -419,7 +194,7 @@ struct KalshiOrderbookSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct KalshiOrderbookDelta {
+pub struct KalshiOrderbookDelta {
     market_ticker: String,
     market_id: String,
     price: Decimal,
@@ -428,7 +203,7 @@ struct KalshiOrderbookDelta {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct KalshiPublicTrade {
+pub struct KalshiPublicTrade {
     trade_id: String,
     market_ticker: String,
     yes_price: Decimal,
@@ -440,7 +215,7 @@ struct KalshiPublicTrade {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct KalshiTicker {
+pub struct KalshiTicker {
     market_ticker: String,
     price: Decimal,
     yes_bid: Decimal,
@@ -459,6 +234,33 @@ enum KalshiSide {
     No,
 }
 
+impl From<KalshiSide> for Side {
+    fn from(side: KalshiSide) -> Self {
+        match side {
+            KalshiSide::Yes => Side::Bid,
+            KalshiSide::No => Side::Ask,
+        }
+    }
+}
+
 fn penny_price(price: Decimal) -> Decimal {
     price / dec!(100)
+}
+
+impl Row {
+    fn from_kalshi_trade(t: &KalshiPublicTrade) -> Self {
+        let (side, price, size) = match t.taker_side {
+            KalshiSide::Yes => (Side::Bid, penny_price(t.yes_price), t.count),
+            KalshiSide::No => (Side::Ask, penny_price(t.yes_price), t.count),
+        };
+        Self {
+            timestamp: t.ts.to_string(),
+            kind: "TRADE",
+            market: t.market_ticker.clone(),
+            asset: None,
+            side,
+            price,
+            size,
+        }
+    }
 }

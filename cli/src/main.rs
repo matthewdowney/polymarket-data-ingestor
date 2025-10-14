@@ -4,6 +4,7 @@ use clap::{CommandFactory, Parser};
 use cli::args::{Args, Commands, DownloadArgs, MarketsArgs, ReplayArgs};
 use cli::file_reader::HistoricalDataReader;
 use cli::get_handler;
+use cli::read_market_info;
 use cli::Venue;
 use std::path::PathBuf;
 
@@ -85,7 +86,7 @@ async fn run_markets(args: &MarketsArgs, venue: Venue) -> Result<()> {
         .ok_or(anyhow!("no data files found"))?;
 
     let handler = get_handler(venue.clone());
-    let msg = handler.read_market_info(&file)?;
+    let msg = read_market_info(&file)?;
 
     if args.raw {
         println!("{}", serde_json::to_string(&msg)?);
