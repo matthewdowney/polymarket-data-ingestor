@@ -10,6 +10,8 @@ use std::path::PathBuf;
 
 /// Directory where raw feed logs are cached
 const DATA_DIR: &str = "./data/gcs_cache";
+const KALSHI_BUCKET_NAME: &str = "kalshi-data-bucket";
+const POLYMARKET_BUCKET_NAME: &str = "polymarket-data-bucket";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,9 +31,11 @@ async fn run_download(args: &DownloadArgs, venue: Venue) -> Result<()> {
     }
     let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
 
-    let cache_dir = PathBuf::from(DATA_DIR);
-    let reader = HistoricalDataReader::new(cache_dir, start, end, venue.clone());
-    reader.download_from_gcs().await?;
+    let subdir = venue_dir(&venue);
+    let bucket = bucket_name(&venue);
+    let cache_dir = PathBuf::from(DATA_DIR).join(subdir);
+    let reader = HistoricalDataReader::new(cache_dir, start, end);
+    reader.download_from_gcs(bucket).await?;
 
     // Discover files in cache directory
     let files = reader.discover_files_with_gcs_cache()?;
@@ -49,8 +53,9 @@ async fn run_replay(args: &ReplayArgs, venue: Venue) -> Result<()> {
     }
 
     let (start, end) = parse_time_range(args.since.clone(), args.start.clone(), args.end.clone())?;
-    let cache_dir = PathBuf::from(DATA_DIR);
-    let reader = HistoricalDataReader::new(cache_dir, start, end, venue.clone());
+    let subdir = venue_dir(&venue);
+    let cache_dir = PathBuf::from(DATA_DIR).join(subdir);
+    let reader = HistoricalDataReader::new(cache_dir, start, end);
 
     // Read the files in order, keep track of market state, and write ticks to the output file
     let output_path = if let Some(output) = args.output.clone() {
@@ -75,8 +80,9 @@ async fn run_markets(args: &MarketsArgs, venue: Venue) -> Result<()> {
     let start = args.start.clone().unwrap_or("1970-01-01".to_string());
 
     let (start, end) = parse_time_range(args.since.clone(), Some(start), Some(today))?;
-    let cache_dir = PathBuf::from(DATA_DIR);
-    let reader = HistoricalDataReader::new(cache_dir, start, end, venue.clone());
+    let subdir = venue_dir(&venue);
+    let cache_dir = PathBuf::from(DATA_DIR).join(subdir);
+    let reader = HistoricalDataReader::new(cache_dir, start, end);
 
     // Use first file in range if provided, otherwise use most recent file
     let files = reader.discover_files_with_gcs_cache()?;
@@ -141,4 +147,18 @@ fn parse_ts(timestamp_str: &str) -> Result<DateTime<Utc>> {
     }
 
     Err(anyhow!("Unable to parse timestamp: {}. Supported formats: RFC3339 (2024-01-01T12:00:00Z), ISO without timezone (2024-01-01T12:00:00), or date only (2024-01-01)", timestamp_str))
+}
+
+fn venue_dir(venue: &Venue) -> &'static str {
+    match venue {
+        Venue::Polymarket => "polymarket",
+        Venue::Kalshi => "kalshi",
+    }
+}
+
+fn bucket_name(venue: &Venue) -> &'static str {
+    match venue {
+        Venue::Polymarket => POLYMARKET_BUCKET_NAME,
+        Venue::Kalshi => KALSHI_BUCKET_NAME,
+    }
 }

@@ -5,10 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tokio::task::JoinSet;
 
-/// Venue specific bucket names
-const KALSHI_BUCKET_NAME: &str = "kalshi-data-bucket";
-const POLYMARKET_BUCKET_NAME: &str = "polymarket-data-bucket";
-
 const GCS_PREFIX: &str = "raw/";
 const BATCH_SIZE: usize = 4; // Number of files to download in parallel
 
@@ -37,17 +33,6 @@ impl GcsDownloader {
             local_cache_dir: cache_dir,
             bucket_name,
         })
-    }
-
-    /// Venue specific helper methods
-    pub async fn new_polymarket(cache_dir: PathBuf) -> Result<Self> {
-        let venue_cache_dir = cache_dir.join("polymarket");
-        Self::new(venue_cache_dir, POLYMARKET_BUCKET_NAME.to_string()).await
-    }
-
-    pub async fn new_kalshi(cache_dir: PathBuf) -> Result<Self> {
-        let venue_cache_dir = cache_dir.join("kalshi");
-        Self::new(venue_cache_dir, KALSHI_BUCKET_NAME.to_string()).await
     }
 
     /// Download files for a specific time range

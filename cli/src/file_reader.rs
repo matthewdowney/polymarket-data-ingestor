@@ -4,13 +4,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::gcs_downloader::GcsDownloader;
-use super::Venue;
 
 pub struct HistoricalDataReader {
     cache_dir: PathBuf,
     start_timestamp: DateTime<Utc>,
     end_timestamp: DateTime<Utc>,
-    venue: Venue,
 }
 
 impl HistoricalDataReader {
@@ -18,28 +16,22 @@ impl HistoricalDataReader {
         cache_dir: PathBuf,
         start_timestamp: DateTime<Utc>,
         end_timestamp: DateTime<Utc>,
-        venue: Venue,
     ) -> Self {
         Self {
             cache_dir,
             start_timestamp,
             end_timestamp,
-            venue,
         }
     }
 
     /// Download required files from GCS
-    pub async fn download_from_gcs(&self) -> Result<()> {
-        let downloader = match self.venue {
-            Venue::Polymarket => GcsDownloader::new_polymarket(self.cache_dir.clone()).await?,
-            Venue::Kalshi => GcsDownloader::new_kalshi(self.cache_dir.clone()).await?,
-        };
+    pub async fn download_from_gcs(&self, bucket_name: &str) -> Result<()> {
+        let downloader = GcsDownloader::new(self.cache_dir.clone(), bucket_name.to_string()).await?;
 
         println!(
-            "Downloading files from GCS for time range {} to {} on venue {:?}",
+            "Downloading files from GCS for time range {} to {}",
             self.start_timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
             self.end_timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
-            self.venue,
         );
 
         let downloaded_files = downloader
@@ -52,11 +44,7 @@ impl HistoricalDataReader {
 
     /// Discover files including GCS cache directory
     pub fn discover_files_with_gcs_cache(&self) -> Result<Vec<PathBuf>> {
-        let venue_dir = match self.venue {
-            Venue::Polymarket => self.cache_dir.join("polymarket"),
-            Venue::Kalshi => self.cache_dir.join("kalshi"),
-        };
-        let mut cache_files = self.discover_files_in_directory(&venue_dir)?;
+        let mut cache_files = self.discover_files_in_directory(&self.cache_dir)?;
         cache_files.sort();
         Ok(cache_files)
     }
