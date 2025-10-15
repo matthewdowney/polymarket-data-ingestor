@@ -1,5 +1,6 @@
-use crate::client::connection::{Connection, ConnectionEvent, ConnectionId};
+use crate::client::connection::Connection;
 use crate::client::{split_markets, MAX_PARALLELISM};
+use crate::{ConnectionEvent, ConnectionId};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};

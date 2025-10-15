@@ -1,6 +1,6 @@
-# Polymarket Data Ingestor
+# Prediction Market Data Ingestor
 
-Code for streaming, recording, and replaying Polymarket order book data.
+Code for streaming, recording, and replaying Polymarket and Kalshi order book data.
 
 ## Overview
 
@@ -12,19 +12,21 @@ Three Rust binaries, each handling a different part of the data pipeline.
 
 - `./cli` Historical data tools. Downloads from GCS, replays raw messages to reconstruct order books, generates tick data (trades and BBO updates) as CSV.
 
+At the moment, each service runs separately per venue assigned. It is not possible to run on more than one venue.
+
 ## Running locally
 
 Requires [gcloud](https://cloud.google.com/sdk/docs/install) cli installed and authenticated.
 
 ```bash
 # Stream real-time data
-cargo run --bin collector
+cargo run --bin collector [venue]
 
 # Download historical data
-cargo run --bin cli -- download --since 24h
+cargo run --bin cli [venue] download --since 24h
 
 # Generate tick data in CSV format
-cargo run --bin cli -- replay --since 12h
+cargo run --bin cli [venue] replay --since 12h
 ```
 
 ## Deploying to GCP
@@ -33,13 +35,13 @@ cargo run --bin cli -- replay --since 12h
 # Setup
 gcloud auth login
 gcloud config set project YOUR_PROJECT_ID
-cargo run --bin deploy -- create
+cargo run --bin deploy [venue] create
 
 # Deploy updates
-cargo run --bin deploy -- update
+cargo run --bin deploy [venue] update
 
 # Print recent logs from the container, show SSH command
-cargo run --bin deploy -- status
+cargo run --bin deploy [venue] status
 ```
 
 ## Testing
@@ -48,19 +50,19 @@ cargo run --bin deploy -- status
 cargo test -- --ignored
 ```
 
-## Research workflow
+## Research workflow for Polymarket
 
 Download a day of data:
 
-    cargo run --release --bin cli -- download -t 24h
+    cargo run --release --bin cli polymarket download -t 24h
 
 Generate tick data from the feed logs:
 
-    cargo run --release --bin cli -- replay -t 24h -o ticks.csv
+    cargo run --release --bin cli polymarket replay -t 24h -o ticks.csv
 
 Use the CLI to find market and asset ids:
 
-    cargo run --release --bin cli -- markets "Will Iran close"
+    cargo run --release --bin cli polymarket markets "Will Iran close"
 
     Will Iran close the Strait of Hormuz in 2025?
         0x89ff77ee1c11d6c8a480bfaab11eefd6f87b8f2076a065be0706453857dc0958

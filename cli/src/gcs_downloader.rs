@@ -5,18 +5,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tokio::task::JoinSet;
 
-const BUCKET_NAME: &str = "polymarket-data-bucket";
 const GCS_PREFIX: &str = "raw/";
 const BATCH_SIZE: usize = 4; // Number of files to download in parallel
 
 #[derive(Clone)]
 pub struct GcsDownloader {
     local_cache_dir: PathBuf,
+    bucket_name: String,
 }
 
 impl GcsDownloader {
     /// Create a new GCS downloader that uses gcloud storage
-    pub async fn new(cache_dir: PathBuf) -> Result<Self> {
+    pub async fn new(cache_dir: PathBuf, bucket_name: String) -> Result<Self> {
         // Create cache directory if it doesn't exist
         fs::create_dir_all(&cache_dir)?;
 
@@ -31,6 +31,7 @@ impl GcsDownloader {
 
         Ok(Self {
             local_cache_dir: cache_dir,
+            bucket_name,
         })
     }
 
@@ -125,7 +126,7 @@ impl GcsDownloader {
 
     /// Download a single file from GCS using gcloud storage
     async fn download_file(&self, file_name: &str, local_path: &Path) -> Result<()> {
-        let gcs_path = format!("gs://{}/{}{}", BUCKET_NAME, GCS_PREFIX, file_name);
+        let gcs_path = format!("gs://{}/{}{}", self.bucket_name, GCS_PREFIX, file_name);
 
         // Create parent directory if it doesn't exist
         if let Some(parent) = local_path.parent() {
