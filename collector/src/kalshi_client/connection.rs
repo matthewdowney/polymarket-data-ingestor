@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use futures_util::SinkExt;
+use futures_util::{SinkExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -9,7 +9,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::kalshi_client::{CONNECTION_ID, INITIAL_READ_TIMEOUT, PING_INTERVAL, WS_URL};
+use crate::kalshi_client::{CONNECTION_ID, INITIAL_READ_TIMEOUT, WS_URL};
 use crate::{await_first_msg, spawn_msg_handler, ConnectionEvent, KalshiCredentials, KalshiMarket};
 use tokio_util::sync::CancellationToken;
 
@@ -82,7 +82,7 @@ impl Connection {
             )
             .await?;
             let handle = spawn_msg_handler(
-                PING_INTERVAL,
+                None,
                 ws,
                 self.tx.clone(),
                 self.shutdown.clone(),

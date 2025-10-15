@@ -103,7 +103,7 @@ impl Connection {
             )
             .await?;
             let handle = spawn_msg_handler(
-                PING_INTERVAL,
+                Some(PING_INTERVAL),
                 ws,
                 self.tx.clone(),
                 self.shutdown.clone(),
@@ -138,6 +138,7 @@ impl Connection {
         }
     }
 
+    /// Close the connection if open and wait for the message handler to finish.
     pub async fn close(&mut self) -> Result<()> {
         if let Some(handle) = self.handle.take() {
             self.shutdown.cancel();

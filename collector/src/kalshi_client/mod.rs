@@ -10,8 +10,6 @@ pub const BASE_URL: &str = "https://api.elections.kalshi.com/trade-api/v2";
 pub const WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 /// How long to wait for the first socket message before considering the feed dead.
 pub const INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// How often to send application-level pings to the server
-pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// We only open one connection on Kalshi, so we assign ID to 0.
 const CONNECTION_ID: ConnectionId = ConnectionId(0);
 

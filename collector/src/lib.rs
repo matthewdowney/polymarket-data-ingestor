@@ -290,7 +290,7 @@ pub async fn await_first_msg(
 
 /// Take ownership of the WebSocket and handle incoming messages until the connection closes.
 pub async fn spawn_msg_handler(
-    ping: Duration,
+    ping: Option<Duration>,
     mut ws: Socket,
     tx: mpsc::Sender<ConnectionEvent>,
     shutdown: CancellationToken,
@@ -298,8 +298,10 @@ pub async fn spawn_msg_handler(
     opened_at: Option<Instant>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ping_interval = tokio::time::interval(ping);
-        ping_interval.tick().await;
+        let mut ping_interval = ping.map(|p| tokio::time::interval(p));
+        if let Some(ref mut interval) = ping_interval {
+            interval.tick().await;
+        }
 
         loop {
             tokio::select! {
@@ -347,7 +349,12 @@ pub async fn spawn_msg_handler(
                     }
                 }
 
-                _ = ping_interval.tick() => {
+                _ = async {
+                    match ping_interval.as_mut() {
+                        Some(interval) => interval.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     if let Err(e) = ws.send(Message::Text(r#"{"type":"ping"}"#.into())).await {
                         tracing::error!(connection_id = ?id, error = %e, "failed to send ping");
                         break;
