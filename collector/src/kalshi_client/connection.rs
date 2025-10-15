@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -10,7 +10,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::kalshi_client::{CONNECTION_ID, INITIAL_READ_TIMEOUT, PING_INTERVAL, WS_URL};
-use crate::{ConnectionEvent, KalshiCredentials, KalshiMarket};
+use crate::{await_first_msg, spawn_msg_handler, ConnectionEvent, KalshiCredentials, KalshiMarket};
 use tokio_util::sync::CancellationToken;
 
 /// Subscription ID for the next subscription message.
@@ -74,8 +74,22 @@ impl Connection {
 
             // Only consider the connection fully open once we see a message,
             // then spawn a task to handle the rest of the messages
-            self.await_first_msg(&mut ws).await?;
-            let handle = self.spawn_msg_handler(ws).await;
+            await_first_msg(
+                &mut ws,
+                INITIAL_READ_TIMEOUT,
+                CONNECTION_ID,
+                self.tx.clone(),
+            )
+            .await?;
+            let handle = spawn_msg_handler(
+                PING_INTERVAL,
+                ws,
+                self.tx.clone(),
+                self.shutdown.clone(),
+                CONNECTION_ID,
+                None,
+            )
+            .await;
             self.handle = Some(handle);
             Ok(())
         }
@@ -172,117 +186,6 @@ impl Connection {
             .await
             .context("sending sub msg")?;
         Ok(())
-    }
-
-    /// Await the first message from the WebSocket, or timeout and close the connection.
-    async fn await_first_msg(&mut self, ws: &mut Socket) -> Result<()> {
-        let msg = timeout(INITIAL_READ_TIMEOUT, ws.next()).await?;
-        if let Some(Ok(Message::Text(text))) = msg {
-            self.tx
-                .send(ConnectionEvent::ConnectionOpened(CONNECTION_ID))
-                .await
-                .context("sending connection opened event")?;
-
-            self.tx
-                .send(ConnectionEvent::FeedMessage(text.to_string()))
-                .await
-                .context("sending first feed message")?;
-
-            Ok(())
-        } else {
-            let _ = ws.close(None).await;
-
-            // For failed initial connections, log that connection failed to establish
-            tracing::warn!("connection failed to establish within timeout");
-
-            self.tx
-                .send(ConnectionEvent::ConnectionClosed(CONNECTION_ID))
-                .await
-                .context("sending connection closed event")?;
-            Err(anyhow::anyhow!(
-                "no message received within {} seconds",
-                INITIAL_READ_TIMEOUT.as_secs()
-            ))
-        }
-    }
-
-    /// Take ownership of the WebSocket and handle incoming messages until the connection closes.
-    async fn spawn_msg_handler(&mut self, mut ws: Socket) -> JoinHandle<()> {
-        let tx = self.tx.clone();
-        let shutdown = self.shutdown.clone();
-
-        tokio::spawn(async move {
-            let mut ping_interval = tokio::time::interval(PING_INTERVAL);
-            // Skip the initial long delay so the first tick fires after PING_INTERVAL
-            ping_interval.tick().await;
-
-            loop {
-                tokio::select! {
-                    // Prioritize shutdown so the connection can be closed even if there are new ws messages
-                    biased;
-                    _ = shutdown.cancelled() => {
-                        tracing::debug!("connection closed by client");
-                        break;
-                    }
-
-                    msg = ws.next() => {
-                        match msg {
-                            Some(Ok(Message::Text(text))) => {
-                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                                    if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
-                                        match msg_type {
-                                            "error" => {
-                                                tracing::error!(message = %text, "received error from kalshi, closing connection");
-                                                break;
-                                            }
-                                            "unsubscribed" => {
-                                                tracing::warn!(message = %text, "received unsubscribed from kalshi, closing connection");
-                                                break;
-                                            }
-                                            _ => {} // ignore other message types for now
-                                        }
-                                    }
-                                }
-                                if let Err(e) = tx.send(ConnectionEvent::FeedMessage(text.to_string())).await {
-                                    tracing::error!(error = %e, "failed to send message");
-                                    break;
-                                }
-                            }
-                            Some(Ok(Message::Close(_))) => {
-                                tracing::warn!("connection closed by server");
-                                break;
-                            }
-                            Some(Err(e)) => {
-                                tracing::warn!(error = %e, "WebSocket error");
-                                break;
-                            }
-                            Some(_) => {
-                                // Ignore other message types
-                            }
-                            None => {
-                                tracing::warn!("WebSocket stream ended");
-                                break;
-                            }
-                        }
-                    }
-
-                    _ = ping_interval.tick() => {
-                        if let Err(e) = ws.send(Message::Text(r#"{"type":"ping"}"#.into())).await {
-                            tracing::error!(error = %e, "failed to send ping");
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Close the WebSocket
-            let _ = ws.close(None).await;
-
-            // Notify that the connection is closed
-            let _ = tx
-                .send(ConnectionEvent::ConnectionClosed(CONNECTION_ID))
-                .await;
-        })
     }
 }
 

@@ -22,10 +22,11 @@
 //! }
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Utc};
 use futures::Stream;
+use futures_util::{SinkExt, StreamExt};
 use rand::rngs::OsRng;
 use rsa::pss::SigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
@@ -35,8 +36,12 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::sync::mpsc;
+use std::task::Poll;
+use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
+use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
+use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_util::sync::CancellationToken;
 
 pub mod client;
 pub mod kalshi_client;
@@ -233,7 +238,10 @@ pub struct FeedEventStream {
 impl Stream for FeedEventStream {
     type Item = FeedEvent;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
     }
 }
@@ -242,4 +250,136 @@ impl FeedEventStream {
     fn new(rx: mpsc::Receiver<FeedEvent>) -> Self {
         Self { rx }
     }
+}
+
+pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Await the first message from the WebSocket, or timeout and close the connection.
+pub async fn await_first_msg(
+    ws: &mut Socket,
+    timeout_duration: Duration,
+    id: ConnectionId,
+    tx: mpsc::Sender<ConnectionEvent>,
+) -> Result<Option<Instant>> {
+    let msg = timeout(timeout_duration, ws.next()).await?;
+    if let Some(Ok(Message::Text(text))) = msg {
+        tx.send(ConnectionEvent::ConnectionOpened(id.clone()))
+            .await
+            .context("sending connection opened event")?;
+
+        tx.send(ConnectionEvent::FeedMessage(text.to_string()))
+            .await
+            .context("sending first feed message")?;
+
+        Ok(Some(Instant::now()))
+    } else {
+        let _ = ws.close(None).await;
+
+        // For failed initial connections, log that connection failed to establish
+        tracing::warn!(connection_id = ?id, "connection failed to establish within timeout");
+
+        tx.send(ConnectionEvent::ConnectionClosed(id.clone()))
+            .await
+            .context("sending connection closed event")?;
+        Err(anyhow::anyhow!(
+            "no message received within {} seconds",
+            timeout_duration.as_secs()
+        ))
+    }
+}
+
+/// Take ownership of the WebSocket and handle incoming messages until the connection closes.
+pub async fn spawn_msg_handler(
+    ping: Duration,
+    mut ws: Socket,
+    tx: mpsc::Sender<ConnectionEvent>,
+    shutdown: CancellationToken,
+    id: ConnectionId,
+    opened_at: Option<Instant>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ping_interval = tokio::time::interval(ping);
+        ping_interval.tick().await;
+
+        loop {
+            tokio::select! {
+                // Prioritize shutdown so the connection can be closed even if there are new ws messages
+                biased;
+                _ = shutdown.cancelled() => {
+                    tracing::debug!(connection_id = ?id, "connection closed by client");
+                    break;
+                }
+
+                msg = ws.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                                    match msg_type {
+                                        "error" => {
+                                            tracing::error!(connection_id = ?id, message = %text, "received error, closing connection");
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if let Err(e) = tx.send(ConnectionEvent::FeedMessage(text.to_string())).await {
+                                tracing::error!(connection_id = ?id, error = %e, "failed to send message");
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            tracing::warn!(connection_id = ?id, "connection closed by server");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(connection_id = ?id, error = %e, "WebSocket error");
+                            break;
+                        }
+                        Some(_) => {
+                            // Ignore other message types
+                        }
+                        None => {
+                            tracing::warn!(connection_id = ?id, "WebSocket stream ended");
+                            break;
+                        }
+                    }
+                }
+
+                _ = ping_interval.tick() => {
+                    if let Err(e) = ws.send(Message::Text(r#"{"type":"ping"}"#.into())).await {
+                        tracing::error!(connection_id = ?id, error = %e, "failed to send ping");
+                        break;
+                    }
+                }
+            }
+        }
+
+        let _ = ws.close(None).await;
+
+        if let Some(opened_time) = opened_at {
+            let connection_duration = opened_time.elapsed();
+            tracing::info!(
+                connection_id = ?id,
+                duration_secs = connection_duration.as_secs(),
+                duration_ms = connection_duration.as_millis(),
+                "connection closed after duration"
+            );
+        }
+
+        let _ = tx.send(ConnectionEvent::ConnectionClosed(id)).await;
+    })
+}
+
+/// Close the connection if open and wait for the message handler to finish.
+pub async fn close(mut handle: Option<JoinHandle<()>>, shutdown: CancellationToken) -> Result<()> {
+    if let Some(handle) = handle.take() {
+        shutdown.cancel();
+
+        handle
+            .await
+            .context("waiting for message handler to finish")?;
+    }
+    Ok(())
 }

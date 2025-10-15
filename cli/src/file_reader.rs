@@ -26,7 +26,8 @@ impl HistoricalDataReader {
 
     /// Download required files from GCS
     pub async fn download_from_gcs(&self, bucket_name: &str) -> Result<()> {
-        let downloader = GcsDownloader::new(self.cache_dir.clone(), bucket_name.to_string()).await?;
+        let downloader =
+            GcsDownloader::new(self.cache_dir.clone(), bucket_name.to_string()).await?;
 
         println!(
             "Downloading files from GCS for time range {} to {}",

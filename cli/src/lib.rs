@@ -197,8 +197,7 @@ impl VenueHandler for PolymarketHandler {
         files: &[PathBuf],
         output_path: PathBuf,
         markets: Option<Vec<String>>,
-    ) -> Result<()>
-    {
+    ) -> Result<()> {
         let mut state = tick_generator::MarketState::default();
         if let Some(markets) = markets {
             state.with_market_filter(markets);
@@ -280,8 +279,7 @@ impl VenueHandler for KalshiHandler {
         files: &[PathBuf],
         output_path: PathBuf,
         markets: Option<Vec<String>>,
-    ) -> Result<()>
-    {
+    ) -> Result<()> {
         let mut state = kalshi_tick_generator::MarketState::default();
         if let Some(markets) = markets {
             state.with_market_filter(markets);
@@ -302,7 +300,9 @@ impl VenueHandler for KalshiHandler {
                 let frame_ts = parse_timestamp(&frame.timestamp)?;
                 let msgs: Vec<kalshi_tick_generator::FeedMessage> = match frame.content {
                     serde_json::Value::String(s) if s != "PONG" => {
-                        vec![serde_json::from_str::<kalshi_tick_generator::FeedMessage>(&s)?]
+                        vec![serde_json::from_str::<kalshi_tick_generator::FeedMessage>(
+                            &s,
+                        )?]
                     }
                     _ => continue,
                 };

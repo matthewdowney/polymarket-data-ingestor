@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use native_tls::TlsConnector;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -11,7 +11,7 @@ use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use crate::client::{INITIAL_READ_TIMEOUT, PING_INTERVAL, WS_URL};
-use crate::{ConnectionEvent, ConnectionId, PolymarketMarket};
+use crate::{await_first_msg, spawn_msg_handler, ConnectionEvent, ConnectionId, PolymarketMarket};
 use tokio_util::sync::CancellationToken;
 
 /// Represents a single WebSocket shard covering a subset of all markets.
@@ -95,8 +95,22 @@ impl Connection {
 
             // Only consider the connection fully open once we see a message,
             // then spawn a task to handle the rest of the messages
-            self.await_first_msg(&mut ws).await?;
-            let handle = self.spawn_msg_handler(ws).await;
+            self.opened_at = await_first_msg(
+                &mut ws,
+                INITIAL_READ_TIMEOUT,
+                self.id.clone(),
+                self.tx.clone(),
+            )
+            .await?;
+            let handle = spawn_msg_handler(
+                PING_INTERVAL,
+                ws,
+                self.tx.clone(),
+                self.shutdown.clone(),
+                self.id.clone(),
+                self.opened_at,
+            )
+            .await;
             self.handle = Some(handle);
             self.has_ever_opened = true;
             Ok(())
@@ -124,7 +138,6 @@ impl Connection {
         }
     }
 
-    /// Close the connection if open and wait for the message handler to finish.
     pub async fn close(&mut self) -> Result<()> {
         if let Some(handle) = self.handle.take() {
             self.shutdown.cancel();
@@ -235,118 +248,6 @@ impl Connection {
             .await
             .context("sending sub msg")?;
         Ok(())
-    }
-
-    /// Await the first message from the WebSocket, or timeout and close the connection.
-    async fn await_first_msg(&mut self, ws: &mut Socket) -> Result<()> {
-        let msg = timeout(INITIAL_READ_TIMEOUT, ws.next()).await?;
-        if let Some(Ok(Message::Text(text))) = msg {
-            // Record the time when connection was successfully opened
-            self.opened_at = Some(Instant::now());
-
-            self.tx
-                .send(ConnectionEvent::ConnectionOpened(self.id.clone()))
-                .await
-                .context("sending connection opened event")?;
-
-            self.tx
-                .send(ConnectionEvent::FeedMessage(text.to_string()))
-                .await
-                .context("sending first feed message")?;
-            Ok(())
-        } else {
-            let _ = ws.close(None).await;
-
-            // For failed initial connections, log that connection failed to establish
-            tracing::warn!(
-                connection_id = ?self.id,
-                "connection failed to establish within timeout"
-            );
-
-            self.tx
-                .send(ConnectionEvent::ConnectionClosed(self.id.clone()))
-                .await
-                .context("sending connection closed event")?;
-            Err(anyhow::anyhow!(
-                "no message received within {} seconds",
-                INITIAL_READ_TIMEOUT.as_secs()
-            ))
-        }
-    }
-
-    /// Take ownership of the WebSocket and handle incoming messages until the connection closes.
-    async fn spawn_msg_handler(&mut self, mut ws: Socket) -> JoinHandle<()> {
-        let id = self.id.clone();
-        let tx = self.tx.clone();
-        let shutdown = self.shutdown.clone();
-        let opened_at = self.opened_at;
-
-        tokio::spawn(async move {
-            let mut ping_interval = tokio::time::interval(PING_INTERVAL);
-            // Skip the initial long delay so the first tick fires after PING_INTERVAL
-            ping_interval.tick().await;
-
-            loop {
-                tokio::select! {
-                    // Prioritize shutdown so the connection can be closed even if there are new ws messages
-                    biased;
-                    _ = shutdown.cancelled() => {
-                        tracing::debug!(connection_id = ?id, "connection closed by client");
-                        break;
-                    }
-
-                    msg = ws.next() => {
-                        match msg {
-                            Some(Ok(Message::Text(text))) => {
-                                if let Err(e) = tx.send(ConnectionEvent::FeedMessage(text.to_string())).await {
-                                    tracing::error!(connection_id = ?id, error = %e, "failed to send message");
-                                    break;
-                                }
-                            }
-                            Some(Ok(Message::Close(_))) => {
-                                tracing::warn!(connection_id = ?id, "connection closed by server");
-                                break;
-                            }
-                            Some(Err(e)) => {
-                                tracing::warn!(connection_id = ?id, error = %e, "WebSocket error");
-                                break;
-                            }
-                            Some(_) => {
-                                // Ignore other message types
-                            }
-                            None => {
-                                tracing::warn!(connection_id = ?id, "WebSocket stream ended");
-                                break;
-                            }
-                        }
-                    }
-
-                    _ = ping_interval.tick() => {
-                        if let Err(e) = ws.send(Message::Text(r#"{"type":"ping"}"#.into())).await {
-                            tracing::error!(connection_id = ?id, error = %e, "failed to send ping");
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Close the WebSocket
-            let _ = ws.close(None).await;
-
-            // Log connection duration - duration will be processed when connection is closed
-            if let Some(opened_time) = opened_at {
-                let connection_duration = opened_time.elapsed();
-                tracing::info!(
-                    connection_id = ?id,
-                    duration_secs = connection_duration.as_secs(),
-                    duration_ms = connection_duration.as_millis(),
-                    "connection closed after duration"
-                );
-            }
-
-            // Notify that the connection is closed
-            let _ = tx.send(ConnectionEvent::ConnectionClosed(id.clone())).await;
-        })
     }
 }
 
